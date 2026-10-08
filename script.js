@@ -22,6 +22,7 @@
 
   function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k); }
   function isAny(t) { var u = t.toUpperCase(); return t === ANY || u === 'ANY' || u === 'ALL' || t === '*'; }
+  function actionOf(t) { var u = t.toUpperCase(); return has(ACTIONS, u) ? ACTIONS[u] : ''; }
   function arrowProblem(t) {
     if (t === '->' || t === '→') { return ''; }
     if (/^[-=]*>+$|^→+$/.test(t)) { return '箭頭請寫成 ->，目前是「' + t + '」。'; }
@@ -52,25 +53,39 @@
     return { ok: true, norm: intToIp((ipToInt(addr) & maskOf(mask)) >>> 0) + '/' + mask };
   }
 
+  // 埠號：單一埠、範圍、服務名稱，或用逗號連接的多個（80,443,8080-8090）。重疊或相鄰的範圍會合併。
   function parsePort(t) {
     if (isAny(t)) { return { ok: true, norm: ANY }; }
-    var u = t.toUpperCase();
-    if (has(SERVICES, u)) { return { ok: true, norm: String(SERVICES[u]) }; }
-    var m = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(t);
-    if (!m) { return { ok: false, msg: '埠號格式不對：「' + t + '」。請寫成 443、8080-8090、服務名稱（如 HTTPS）或「任意」。' }; }
-    var a = Number(m[1]), b = m[2] === undefined ? a : Number(m[2]);
-    if (a < 1 || a > 65535 || b < 1 || b > 65535) { return { ok: false, msg: '埠號必須在 1 到 65535 之間：「' + t + '」。' }; }
-    if (a > b) { return { ok: false, msg: '埠號範圍的起點不能大於終點：「' + t + '」。' }; }
-    return { ok: true, norm: a === b ? String(a) : a + '-' + b };
+    var parts = t.split(','), ranges = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p === '') { return { ok: false, msg: '埠號清單裡有空的項目：「' + t + '」，多個埠號請用逗號連接且不加空白（例如 80,443）。' }; }
+      if (isAny(p)) { return { ok: true, norm: ANY }; }
+      var u = p.toUpperCase();
+      if (has(SERVICES, u)) { ranges.push([SERVICES[u], SERVICES[u]]); continue; }
+      var m = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(p);
+      if (!m) { return { ok: false, msg: '埠號格式不對：「' + p + '」。請寫成 443、8080-8090、80,443、服務名稱（如 HTTPS）或「任意」。' }; }
+      var a = Number(m[1]), b = m[2] === undefined ? a : Number(m[2]);
+      if (a < 1 || a > 65535 || b < 1 || b > 65535) { return { ok: false, msg: '埠號必須在 1 到 65535 之間：「' + p + '」。' }; }
+      if (a > b) { return { ok: false, msg: '埠號範圍的起點不能大於終點：「' + p + '」。' }; }
+      ranges.push([a, b]);
+    }
+    ranges.sort(function (x, y) { return x[0] - y[0]; });
+    var merged = [];
+    ranges.forEach(function (r) {
+      var last = merged[merged.length - 1];
+      if (last && r[0] <= last[1] + 1) { last[1] = Math.max(last[1], r[1]); } else { merged.push([r[0], r[1]]); }
+    });
+    return { ok: true, norm: merged.map(function (r) { return r[0] === r[1] ? String(r[0]) : r[0] + '-' + r[1]; }).join(',') };
   }
 
   function parseRuleLine(line) {
     var p = line.split(/\s+/);
     if (p.length !== 6) {
-      return { error: '欄位數量不對，應該是「動作 協定 來源 -> 目的 埠號」共 6 個部分（目前 ' + p.length + ' 個）。' };
+      return { error: '欄位數量不對，應該是「動作 協定 來源 -> 目的 埠號」共 6 個部分（目前 ' + p.length + ' 個）。多個埠號請用逗號連接且不加空白，例如 80,443。' };
     }
-    var action = ACTIONS[p[0].toUpperCase()];
-    if (!action || !has(ACTIONS, p[0].toUpperCase())) {
+    var action = actionOf(p[0]);
+    if (!action) {
       return { error: '動作必須是「允許」或「拒絕」（也可寫 allow、permit、deny、drop 等），目前是「' + p[0] + '」。' };
     }
     var proto = isAny(p[1]) ? ANY : p[1].toUpperCase();
@@ -127,12 +142,12 @@
       port = ANY;
     } else {
       var pp = parsePort(p[6]);
-      if (!pp.ok || pp.norm === ANY || pp.norm.indexOf('-') >= 0) { return { error: 'log 的埠號必須是單一數字或服務名稱，目前是「' + p[6] + '」。' }; }
+      if (!pp.ok || pp.norm === ANY || /[-,]/.test(pp.norm)) { return { error: 'log 的埠號必須是單一數字或服務名稱，目前是「' + p[6] + '」。' }; }
       port = pp.norm;
     }
     var action = '';
     if (p.length === 8) {
-      action = has(ACTIONS, p[7].toUpperCase()) ? ACTIONS[p[7].toUpperCase()] : '';
+      action = actionOf(p[7]);
       if (!action) { return { error: '動作必須是「允許」或「拒絕」，目前是「' + p[7] + '」。' }; }
     }
     return { log: { date: p[0], time: p[1], proto: proto, src: src.norm.replace(/\/32$/, ''), dst: dst.norm.replace(/\/32$/, ''), port: port, action: action } };
@@ -161,12 +176,15 @@
     var am = Number(x[1]), bm = Number(y[1]);
     return am <= bm && ((ipToInt(y[0]) & maskOf(am)) >>> 0) === ipToInt(x[0]);
   }
-  function portRange(s) { var r = s.split('-'); return [Number(r[0]), Number(r[r.length - 1])]; }
+  function portRanges(s) {
+    return s.split(',').map(function (x) { var r = x.split('-'); return [Number(r[0]), Number(r[r.length - 1])]; });
+  }
+  // b 的每一段都要落在 a 的某一段裡面
   function portCover(a, b) {
     if (a === ANY) { return true; }
     if (b === ANY) { return false; }
-    var x = portRange(a), y = portRange(b);
-    return x[0] <= y[0] && y[1] <= x[1];
+    var ar = portRanges(a);
+    return portRanges(b).every(function (y) { return ar.some(function (x) { return x[0] <= y[0] && y[1] <= x[1]; }); });
   }
   function covers(a, b) {
     return (a.proto === ANY || a.proto === b.proto) && ipCover(a.src, b.src) && ipCover(a.dst, b.dst) && portCover(a.port, b.port);
@@ -201,8 +219,8 @@
   function portMatch(spec, port) {
     if (spec === ANY) { return true; }
     if (port === ANY) { return false; }
-    var r = portRange(spec), v = Number(port);
-    return v >= r[0] && v <= r[1];
+    var v = Number(port);
+    return portRanges(spec).some(function (r) { return v >= r[0] && v <= r[1]; });
   }
   function ruleHits(rule, log) {
     return (rule.proto === ANY || rule.proto === log.proto) && ipMatch(rule.src, log.src) && ipMatch(rule.dst, log.dst) && portMatch(rule.port, log.port);
@@ -265,15 +283,34 @@
     return r.action + '：' + (r.proto === ANY ? '任何協定' : r.proto) + ' 從 ' + where(r.src) + ' 連到 ' + where(r.dst) + portText;
   }
 
+  // 網段實體範圍（給滑鼠懸停提示用）
+  function cidrInfo(norm) {
+    var parts = norm.split('/'), mask = Number(parts[1]);
+    var net = (ipToInt(parts[0]) & maskOf(mask)) >>> 0;
+    var size = Math.pow(2, 32 - mask);
+    var last = (net + size - 1) >>> 0;
+    if (mask === 32) { return '單一主機 ' + parts[0]; }
+    if (mask === 31) { return intToIp(net) + ' – ' + intToIp(last) + '（2 個位址，點對點連線）'; }
+    return intToIp(net) + ' – ' + intToIp(last) + '（共 ' + size.toLocaleString('en-US') + ' 個位址，可用主機 ' + intToIp(net + 1) + ' – ' + intToIp(last - 1) + '）';
+  }
+
+  function addrSpan(v) {
+    if (v === ANY) { var a = el('span', 'any', ANY); a.title = '任意位址（所有 IPv4）'; return a; }
+    var s = el('span', 'ip', disp(v));
+    s.title = cidrInfo(v);
+    if (/\/(?!32$)/.test(v)) { s.className = 'ip cidr'; }
+    return s;
+  }
+
   function ruleNode(r, label) {
     var d = el('div', 'rule');
     if (label) { d.appendChild(el('em', 'lab', label)); }
     d.appendChild(el('span', 'act ' + (r.action === '允許' ? 'allow' : 'deny'), r.action));
-    d.appendChild(el('span', 'pro', r.proto));
-    d.appendChild(el('span', '', disp(r.src)));
+    d.appendChild(el('span', r.proto === ANY ? 'pro any' : 'pro', r.proto));
+    d.appendChild(addrSpan(r.src));
     d.appendChild(el('span', 'arrow', '→'));
-    d.appendChild(el('span', '', disp(r.dst)));
-    d.appendChild(el('span', '', r.port === ANY ? '任意埠' : '埠 ' + r.port));
+    d.appendChild(addrSpan(r.dst));
+    d.appendChild(r.port === ANY ? el('span', 'any', '任意埠') : el('span', 'port', '埠 ' + r.port));
     return d;
   }
 
@@ -337,15 +374,69 @@
   }
 
   /* =========================================================
-     六、輸入框：行號、錯誤行反白、即時語法檢查
+     六、暫存（localStorage）與主題
+     ========================================================= */
+  var STORE = 'fw-diff-v2', THEME_KEY = 'fw-theme';
+  function loadSaved() {
+    try { var s = localStorage.getItem(STORE); return s ? JSON.parse(s) : null; } catch (e) { return null; }
+  }
+  function save() {
+    try {
+      localStorage.setItem(STORE, JSON.stringify({
+        oldRules: $('oldRules').value, newRules: $('newRules').value,
+        mapRules: $('mapRules').value, mapLogs: $('mapLogs').value, def: $('defPolicy').value
+      }));
+    } catch (e) { /* 無痕模式或儲存空間已滿時略過 */ }
+  }
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-fw-theme', t);
+    var b = $('themeBtn');
+    b.textContent = t === 'dark' ? '切換為淺色模式' : '切換為深色模式';
+    b.setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+  }
+
+  /* =========================================================
+     七、輸入框：行號、語法上色、錯誤行反白、即時檢查
      ========================================================= */
   var ED = {};
+
+  function tokenClass(kind, idx, tok) {
+    if (kind === 'rules') {
+      if (idx === 0) { var a = actionOf(tok); return a === '允許' ? 'tk-allow' : (a === '拒絕' ? 'tk-deny' : ''); }
+      if (idx === 1) { return isAny(tok) ? 'tk-any' : 'tk-proto'; }
+      if (idx === 2 || idx === 4) { return isAny(tok) ? 'tk-any' : 'tk-ip'; }
+      if (idx === 3) { return 'tk-arrow'; }
+      if (idx === 5) { return isAny(tok) ? 'tk-any' : 'tk-port'; }
+      return '';
+    }
+    if (idx === 0 || idx === 1) { return 'tk-date'; }
+    if (idx === 2) { return 'tk-proto'; }
+    if (idx === 3 || idx === 5) { return 'tk-ip'; }
+    if (idx === 4) { return 'tk-arrow'; }
+    if (idx === 6) { return isAny(tok) ? 'tk-any' : 'tk-port'; }
+    if (idx === 7) { var b = actionOf(tok); return b === '允許' ? 'tk-allow' : (b === '拒絕' ? 'tk-deny' : ''); }
+    return '';
+  }
+
+  // 疊在輸入框後面的上色層：文字與輸入框逐字對齊，所以只用顏色，不改粗細或斜體
+  function highlightInto(container, line, kind) {
+    if (line.trim().charAt(0) === '#') { container.appendChild(el('span', 'tk-cm', line)); return; }
+    var idx = 0;
+    line.split(/(\s+)/).forEach(function (p) {
+      if (p === '') { return; }
+      if (/^\s+$/.test(p)) { container.appendChild(document.createTextNode(p)); return; }
+      var cls = tokenClass(kind, idx++, p);
+      if (cls) { container.appendChild(el('span', cls, p)); } else { container.appendChild(document.createTextNode(p)); }
+    });
+  }
+
   function makeEditor(id, kind) {
-    var ta = $(id), gut = $(id + 'Gut'), hl = $(id + 'Hl'), lint = $(id + 'Lint'), timer = 0;
+    var ta = $(id), gut = $(id + 'Gut'), hl = $(id + 'Hl'), lint = $(id + 'Lint'), timer = 0, marked = null;
+    var ed = { onchange: null };
 
     function refresh() {
       var text = ta.value;
-      var L = text.split('\n').length;
+      var lines = text.split('\n'), L = lines.length;
       var errs = [], warns = [], count = 0;
       if (kind === 'rules') {
         var pr = parseRules(text);
@@ -359,21 +450,27 @@
       errs.forEach(function (e) { bad[e.n] = true; });
       warns.forEach(function (w) { wn[w.j.line] = true; });
 
-      gut.textContent = ''; hl.textContent = '';
+      gut.textContent = ''; hl.textContent = ''; marked = null;
       if (L <= 3000) {
         var fg = document.createDocumentFragment(), fh = document.createDocumentFragment();
         for (var i = 1; i <= L; i++) {
           var cls = bad[i] ? ' bad' : (wn[i] ? ' warn' : '');
           fg.appendChild(el('div', 'ln' + cls, String(i)));
-          fh.appendChild(el('div', 'hl-line' + cls));
+          var d = el('div', 'hl-line' + cls);
+          highlightInto(d, lines[i - 1].replace(/\r$/, ''), kind);
+          fh.appendChild(d);
         }
         gut.appendChild(fg); hl.appendChild(fh);
+        ta.classList.add('hlmode');
       } else {
+        // 行數太多時不上色，改回輸入框自己的文字顏色
         var nums = []; for (var k = 1; k <= L; k++) { nums.push(k); }
         gut.style.whiteSpace = 'pre';
         gut.textContent = nums.join('\n');
+        ta.classList.remove('hlmode');
       }
-      gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop;
+      gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft;
+      fit();
 
       lint.textContent = '';
       if (!text.trim()) { lint.appendChild(el('p', 'lint-hint', '尚未輸入內容。')); return; }
@@ -389,14 +486,41 @@
       lint.appendChild(ul);
     }
 
-    ta.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(refresh, 120); });
-    ta.addEventListener('scroll', function () { gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop; });
-    ED[id] = { refresh: refresh };
+    // 上色層與行號欄只貼在輸入框「看得到文字」的範圍內，不要蓋到捲軸底下
+    function fit() {
+      var sbW = ta.offsetWidth - ta.clientWidth, sbH = ta.offsetHeight - ta.clientHeight;
+      hl.style.right = sbW + 'px'; hl.style.bottom = sbH + 'px';
+      gut.style.bottom = sbH + 'px';
+    }
+    if (window.ResizeObserver) { new ResizeObserver(fit).observe(ta); }
+
+    // 讓指定行發亮（跨區連動），必要時捲動到可見範圍
+    function mark(line) {
+      if (marked) { marked.hl.classList.remove('xhl'); marked.ln.classList.remove('xhl'); marked = null; }
+      if (!line) { return; }
+      var h = hl.children[line - 1], g = gut.children[line - 1];
+      if (!h || !g) { return; }
+      h.classList.add('xhl'); g.classList.add('xhl');
+      marked = { hl: h, ln: g };
+      var lh = parseFloat(getComputedStyle(ta).lineHeight) || 24;
+      var top = 12 + (line - 1) * lh;
+      if (top < ta.scrollTop || top + lh > ta.scrollTop + ta.clientHeight) {
+        ta.scrollTop = Math.max(0, top - ta.clientHeight / 3);
+      }
+    }
+
+    ta.addEventListener('input', function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () { refresh(); save(); if (ed.onchange) { ed.onchange(); } }, 150);
+    });
+    ta.addEventListener('scroll', function () { gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; });
+    ed.refresh = refresh; ed.mark = mark;
+    ED[id] = ed;
   }
-  function setVal(id, text) { $(id).value = text; ED[id].refresh(); }
+  function setVal(id, text) { $(id).value = text; ED[id].refresh(); save(); }
 
   /* =========================================================
-     七、示範資料
+     八、示範資料
      ========================================================= */
   var SAMPLE_A = [
     '# 範例 A：舊版規則（虛構示範）',
@@ -409,13 +533,13 @@
   ].join('\n');
 
   var SAMPLE_B = [
-    '# 範例 B：新版規則（虛構示範，混用英文寫法與服務名稱）',
+    '# 範例 B：新版規則（虛構示範，混用英文寫法、服務名稱與多埠號）',
     'allow tcp any -> 192.168.1.10 https',
     'deny tcp any -> any telnet',
     'deny tcp 10.0.0.0/24 -> 192.168.1.20 ssh',
     'allow udp 10.0.0.0/24 -> 192.168.1.53 dns',
     'permit icmp any -> any any',
-    'allow tcp 10.0.1.0/24 -> 192.168.1.30 8080-8090',
+    'allow tcp 10.0.1.0/24 -> 192.168.1.30 80,443,8080-8090',
     'deny tcp 10.0.1.0/24 -> 192.168.1.30 8085'
   ].join('\n');
 
@@ -429,7 +553,8 @@
     'permit icmp any -> any any',
     'deny tcp any -> any 23',
     'allow tcp 10.0.1.0/24 -> 192.168.1.30 8080-8090',
-    '允許 TCP 10.0.0.0/24 -> 任意 443'
+    '允許 TCP 10.0.0.0/24 -> 任意 443',
+    'allow tcp 10.0.2.0/24 -> 192.168.1.30 80,443,8080-8090'
   ].join('\n');
 
   var SAMPLE_LOGS = [
@@ -443,11 +568,12 @@
     '2026-10-08 09:19:55 TCP 10.0.1.15 -> 192.168.1.30 8085 允許',
     '2026-10-08 09:21:12 TCP 203.0.113.50 -> 192.168.1.10 80 拒絕',
     '2026-10-08 09:22:40 UDP 198.51.100.77 -> 192.168.1.53 53 允許',
-    '2026-10-08 09:23:05 TCP 10.0.1.7 -> 192.168.1.10 443 允許'
+    '2026-10-08 09:23:05 TCP 10.0.1.7 -> 192.168.1.10 443 允許',
+    '2026-10-08 09:24:10 TCP 10.0.2.8 -> 192.168.1.30 80 允許'
   ].join('\n');
 
   /* =========================================================
-     八、分頁一：規則比對
+     九、分頁一：規則比對
      ========================================================= */
   var DS = { entries: null, view: 'side', showSame: false };
 
@@ -479,7 +605,7 @@
     if (o.errors.length) { box.appendChild(problemPanel('舊版格式有誤的行', o.errors, true)); }
     if (n.errors.length) { box.appendChild(problemPanel('新版格式有誤的行', n.errors, true)); }
     if (o.errors.length || n.errors.length) {
-      box.appendChild(el('p', 'say', '有格式錯誤的行沒有參與比對，規則編號只計算格式正確的規則。請修正後再按一次「比對」。'));
+      box.appendChild(el('p', 'say', '有格式錯誤的行沒有參與比對，規則編號只計算格式正確的規則。請修正後再比對。'));
     }
     var dupList = [];
     d.dups.old.forEach(function (r) { dupList.push({ n: r.line, text: '（舊版）' + ruleText(r) }); });
@@ -575,7 +701,7 @@
   }
 
   /* =========================================================
-     九、分頁二：規則與 Log 對應
+     十、分頁二：規則與 Log 對應
      ========================================================= */
   var MS = { rows: null, filter: 'all', rp: null, def: '拒絕' };
 
@@ -584,6 +710,7 @@
   function renderMap() {
     var box = $('mapResult');
     box.textContent = '';
+    ED.mapRules.mark(null);
     var rp = parseRules($('mapRules').value);
     var lp = parseLogs($('mapLogs').value);
     if (!rp.rules.length && !lp.logs.length && !rp.errors.length && !lp.errors.length) {
@@ -638,10 +765,16 @@
     if (top.length) {
       var tl = el('ul', 'top3');
       top.forEach(function (t, idx) {
-        var li = el('li');
+        var li = el('li', 'hoverable');
+        li.tabIndex = 0;
         li.appendChild(el('span', 'n', (idx + 1) + '.'));
         li.appendChild(ruleNode(rp.rules[t.no - 1], '#' + t.no));
         li.appendChild(el('span', 'hits', t.n + ' 筆'));
+        var ln = rp.rules[t.no - 1].line;
+        li.addEventListener('mouseenter', function () { ED.mapRules.mark(ln); });
+        li.addEventListener('focus', function () { ED.mapRules.mark(ln); });
+        li.addEventListener('mouseleave', function () { ED.mapRules.mark(null); });
+        li.addEventListener('blur', function () { ED.mapRules.mark(null); });
         tl.appendChild(li);
       });
       dash.appendChild(tl);
@@ -689,6 +822,7 @@
     var host = $('logTable');
     if (!host || !MS.rows) { return; }
     host.textContent = '';
+    ED.mapRules.mark(null);
     var rows = MS.rows.filter(function (r) {
       if (MS.filter === 'deny') { return r.final === '拒絕'; }
       if (MS.filter === 'issue') { return !r.rule || r.mismatch; }
@@ -698,6 +832,7 @@
     var sec = el('section', 'panel');
     sec.appendChild(el('h2', '', 'Log 明細（顯示 ' + Math.min(rows.length, CAP) + ' / ' + rows.length + ' 筆' + (MS.filter === 'all' ? '' : '，已篩選') + '）'));
     if (!rows.length) { sec.appendChild(el('p', 'empty', MS.rows.length ? '沒有符合篩選條件的 log。' : '沒有可顯示的 log。')); host.appendChild(sec); return; }
+    sec.appendChild(el('p', 'say', '把滑鼠移到某一筆 log 上，左側規則清單會亮起它命中的那一條規則。'));
     if (rows.length > CAP) { sec.appendChild(el('p', 'say', '為了讓頁面順暢，最多顯示前 ' + CAP + ' 筆；摘要數字與匯出的 CSV 包含全部。')); }
 
     var wrap = el('div', 'tablewrap');
@@ -709,6 +844,12 @@
     rows.slice(0, CAP).forEach(function (r) {
       var lg = r.log;
       var tr = el('tr', (!r.rule || r.mismatch) ? 'issue' : '');
+      tr.tabIndex = 0;
+      var ruleLine = r.rule ? r.rule.line : 0;
+      tr.addEventListener('mouseenter', function () { ED.mapRules.mark(ruleLine); });
+      tr.addEventListener('focus', function () { ED.mapRules.mark(ruleLine); });
+      tr.addEventListener('mouseleave', function () { ED.mapRules.mark(null); });
+      tr.addEventListener('blur', function () { ED.mapRules.mark(null); });
       tr.appendChild(el('td', 'mono', String(lg.n)));
       tr.appendChild(el('td', 'mono', lg.date + ' ' + lg.time));
       tr.appendChild(el('td', 'mono', lg.proto + ' ' + lg.src + ' → ' + lg.dst + (lg.proto === 'ICMP' ? '' : ':' + lg.port)));
@@ -737,7 +878,7 @@
   }
 
   /* =========================================================
-     十、匯入 log 檔
+     十一、匯入 log 檔
      ========================================================= */
   var MAX_BYTES = 2 * 1024 * 1024;
   function say(msg, bad) {
@@ -783,7 +924,7 @@
   }
 
   /* =========================================================
-     十一、事件與初始化
+     十二、事件與初始化
      ========================================================= */
   function showTab(which) {
     var isDiff = which === 'diff';
@@ -802,19 +943,56 @@
   makeEditor('mapRules', 'rules');
   makeEditor('mapLogs', 'logs');
 
+  // 邊改邊看：輸入內容改變後，右側結果自動更新
+  ED.oldRules.onchange = renderDiff;
+  ED.newRules.onchange = renderDiff;
+  ED.mapRules.onchange = renderMap;
+  ED.mapLogs.onchange = renderMap;
+
   $('tabDiff').addEventListener('click', function () { showTab('diff'); });
   $('tabLog').addEventListener('click', function () { showTab('log'); });
 
+  // 主題與暫存
+  var savedTheme = 'light';
+  try { savedTheme = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light'; } catch (e) { /* 略過 */ }
+  applyTheme(savedTheme);
+  $('themeBtn').addEventListener('click', function () {
+    var t = document.documentElement.getAttribute('data-fw-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(t);
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 略過 */ }
+  });
+
+  var resetTimer = 0;
+  $('resetBtn').addEventListener('click', function () {
+    var b = this;
+    if (!b.dataset.armed) {
+      b.dataset.armed = '1';
+      b.textContent = '再按一次確認清除';
+      resetTimer = setTimeout(function () { delete b.dataset.armed; b.textContent = '清除暫存並還原範例'; }, 3000);
+      return;
+    }
+    clearTimeout(resetTimer);
+    delete b.dataset.armed;
+    b.textContent = '清除暫存並還原範例';
+    try { localStorage.removeItem(STORE); } catch (e) { /* 略過 */ }
+    $('defPolicy').value = 'deny';
+    $('importMsg').hidden = true;
+    setVal('oldRules', SAMPLE_A); setVal('newRules', SAMPLE_B);
+    setVal('mapRules', SAMPLE_RULES); setVal('mapLogs', SAMPLE_LOGS);
+    try { localStorage.removeItem(STORE); } catch (e) { /* 略過 */ }
+    renderDiff(); renderMap();
+  });
+
   // 分頁一
   $('compareBtn').addEventListener('click', renderDiff);
-  $('fillA').addEventListener('click', function () { setVal('oldRules', SAMPLE_A); });
-  $('fillB').addEventListener('click', function () { setVal('newRules', SAMPLE_B); });
-  $('clearOld').addEventListener('click', function () { setVal('oldRules', ''); });
-  $('clearNew').addEventListener('click', function () { setVal('newRules', ''); });
+  $('fillA').addEventListener('click', function () { setVal('oldRules', SAMPLE_A); renderDiff(); });
+  $('fillB').addEventListener('click', function () { setVal('newRules', SAMPLE_B); renderDiff(); });
+  $('clearOld').addEventListener('click', function () { setVal('oldRules', ''); renderDiff(); });
+  $('clearNew').addEventListener('click', function () { setVal('newRules', ''); renderDiff(); });
   $('sampleBtn').addEventListener('click', function () { setVal('oldRules', SAMPLE_A); setVal('newRules', SAMPLE_B); renderDiff(); });
   $('clearBtn').addEventListener('click', function () {
     setVal('oldRules', ''); setVal('newRules', '');
-    $('result').textContent = ''; $('diffTools').hidden = true; DS.entries = null;
+    renderDiff();
   });
   $('viewSide').addEventListener('click', function () { DS.view = 'side'; setPressed('viewSide', 'viewUni', true); renderDiffList(); });
   $('viewUni').addEventListener('click', function () { DS.view = 'uni'; setPressed('viewSide', 'viewUni', false); renderDiffList(); });
@@ -823,17 +1001,17 @@
 
   // 分頁二
   $('mapBtn').addEventListener('click', renderMap);
-  $('fillRules').addEventListener('click', function () { setVal('mapRules', SAMPLE_RULES); });
-  $('fillLogs').addEventListener('click', function () { setVal('mapLogs', SAMPLE_LOGS); });
-  $('clearRules').addEventListener('click', function () { setVal('mapRules', ''); });
-  $('clearLogs').addEventListener('click', function () { setVal('mapLogs', ''); $('importMsg').hidden = true; });
+  $('fillRules').addEventListener('click', function () { setVal('mapRules', SAMPLE_RULES); renderMap(); });
+  $('fillLogs').addEventListener('click', function () { setVal('mapLogs', SAMPLE_LOGS); renderMap(); });
+  $('clearRules').addEventListener('click', function () { setVal('mapRules', ''); renderMap(); });
+  $('clearLogs').addEventListener('click', function () { setVal('mapLogs', ''); $('importMsg').hidden = true; renderMap(); });
   $('mapSampleBtn').addEventListener('click', function () { setVal('mapRules', SAMPLE_RULES); setVal('mapLogs', SAMPLE_LOGS); renderMap(); });
   $('useNewBtn').addEventListener('click', function () { setVal('mapRules', $('newRules').value); renderMap(); });
   $('mapClearBtn').addEventListener('click', function () {
     setVal('mapRules', ''); setVal('mapLogs', '');
-    $('mapResult').textContent = ''; $('importMsg').hidden = true; MS.rows = null;
+    $('importMsg').hidden = true; renderMap();
   });
-  $('defPolicy').addEventListener('change', function () { if (MS.rows) { renderMap(); } });
+  $('defPolicy').addEventListener('change', function () { save(); renderMap(); });
   $('importBtn').addEventListener('click', function () { $('logFile').click(); });
   $('logFile').addEventListener('change', function () { importLogFile(this.files && this.files[0]); this.value = ''; });
   $('mapLogs').addEventListener('dragover', function (e) { e.preventDefault(); });
@@ -842,11 +1020,15 @@
     importLogFile(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]);
   });
 
-  // 開啟頁面時先載入示範資料，讓畫面不是空的
-  setVal('oldRules', SAMPLE_A);
-  setVal('newRules', SAMPLE_B);
-  setVal('mapRules', SAMPLE_RULES);
-  setVal('mapLogs', SAMPLE_LOGS);
+  // 開啟頁面：優先回填上次暫存的內容，沒有才載入示範資料
+  var saved = loadSaved();
+  var pick = function (k, dflt) { return saved && typeof saved[k] === 'string' ? saved[k] : dflt; };
+  if (saved && (saved.def === 'allow' || saved.def === 'deny')) { $('defPolicy').value = saved.def; }
+  setVal('oldRules', pick('oldRules', SAMPLE_A));
+  setVal('newRules', pick('newRules', SAMPLE_B));
+  setVal('mapRules', pick('mapRules', SAMPLE_RULES));
+  setVal('mapLogs', pick('mapLogs', SAMPLE_LOGS));
+  if (!saved) { try { localStorage.removeItem(STORE); } catch (e) { /* 略過 */ } }
   renderDiff();
   renderMap();
 })();
