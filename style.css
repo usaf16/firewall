@@ -121,6 +121,13 @@ textarea:focus{outline:none}
 textarea.hlmode{color:transparent;caret-color:var(--fg)}
 textarea.hlmode::selection{background:var(--sel);color:transparent}
 textarea::placeholder{color:var(--muted)}
+.fmtrow{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:.85rem}
+.fmtrow label{font-weight:500;color:var(--muted)}
+.fmtsel{font:inherit;font-size:.85rem;padding:2px 8px;color:var(--fg);background:var(--field);border:1px solid var(--line-strong);border-radius:6px}
+.fmtlist{display:grid;gap:10px;margin-top:10px}
+.fmtitem{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--field);min-width:0}
+.fmthead{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between}
+.fmtpre{margin:6px 0 0;font-family:var(--mono);font-size:.8rem;line-height:1.5;color:var(--fg);white-space:pre;overflow-x:auto;font-variant-ligatures:none}
 .lint{margin-top:8px;font-size:.85rem}
 .lint p{margin:0}
 .lint-ok{color:var(--add)}

@@ -48,7 +48,10 @@
           <li>埠號：單一埠（443）、範圍（8080-8090）、多個埠（80,443,8080-8090，逗號後不加空白）、服務名稱（http、https、ssh、dns、ftp、telnet、smtp、ntp、smb、rdp、mysql）或「任意」。ICMP 的埠號請寫「任意」。</li>
           <li>服務物件群組：先用一行定義變數，再在埠號欄使用，例如 <code>$WEB = 80,443,8080-8090</code>，之後寫 <code>allow tcp any -&gt; 10.0.0.5 $WEB</code>。變數要先定義後使用，定義行不算規則。</li>
           <li>一行一條，英文不分大小寫。<code>#</code> 開頭的行是註解（灰色），空白行會略過。輸入框左側有行號，格式錯誤的行標紅、錯的欄位會有紅色波浪底線，被前面規則遮蔽或冗餘的行標黃。</li>
+          <li>也支援貼上 iptables、Cisco ACL、CSV／Excel 表格、AWS 安全群組的規則。預設會自動偵測（同一份可以混用簡化寫法），也可以用輸入框上方的「格式」手動指定。下面可以一鍵填入各格式的範例。</li>
+          <li>不用手動貼上：按輸入框右上角的「匯入設定檔」，或把檔案拖進輸入框。可直接吃 iptables-save 的輸出、Cisco 的 running-config（只擷取 ACL 的部分）、CSV、AWS 的 <code>describe-security-groups</code> JSON，也可以是簡化寫法的純文字檔。</li>
         </ul>
+        <div class="fmtlist" data-target="newRules"></div>
         </details>
       </section>
 
@@ -57,10 +60,13 @@
           <div class="panelhead">
             <label for="oldRules"><span class="chip chip-old">舊版</span>舊版規則</label>
             <div class="mini">
+              <button type="button" class="minibtn" id="impOld">匯入設定檔</button>
               <button type="button" class="minibtn" id="fillA">填入範例 A</button>
               <button type="button" class="minibtn" id="clearOld">清空內容</button>
             </div>
           </div>
+          <div class="fmtrow"><label for="oldRulesFmt">格式</label><select id="oldRulesFmt" class="fmtsel"><option value="auto" selected>自動偵測</option><option value="simple">簡化寫法</option><option value="iptables">iptables</option><option value="cisco">Cisco ACL</option><option value="csv">CSV／Excel 表格</option><option value="aws">AWS 安全群組</option></select></div>
+          <p class="say importnote" id="oldRulesMsg" role="status" hidden></p>
           <div class="editor">
             <div class="gutter" id="oldRulesGut" aria-hidden="true"></div>
             <div class="editwrap">
@@ -74,10 +80,13 @@
           <div class="panelhead">
             <label for="newRules"><span class="chip chip-new">新版</span>新版規則</label>
             <div class="mini">
+              <button type="button" class="minibtn" id="impNew">匯入設定檔</button>
               <button type="button" class="minibtn" id="fillB">填入範例 B</button>
               <button type="button" class="minibtn" id="clearNew">清空內容</button>
             </div>
           </div>
+          <div class="fmtrow"><label for="newRulesFmt">格式</label><select id="newRulesFmt" class="fmtsel"><option value="auto" selected>自動偵測</option><option value="simple">簡化寫法</option><option value="iptables">iptables</option><option value="cisco">Cisco ACL</option><option value="csv">CSV／Excel 表格</option><option value="aws">AWS 安全群組</option></select></div>
+          <p class="say importnote" id="newRulesMsg" role="status" hidden></p>
           <div class="editor">
             <div class="gutter" id="newRulesGut" aria-hidden="true"></div>
             <div class="editwrap">
@@ -128,7 +137,10 @@
           <li>一行一筆。<code>#</code> 開頭的行是註解，空白行會略過。</li>
           <li>也可以按「匯入 Log 檔」，或把檔案拖進 Log 輸入框。支援 .txt、.log、.csv（8 MB 以內）。檔案很大時會在背景計算，並以虛擬捲動顯示結果。CSV 的欄位順序同上，可以沒有「->」欄，第一列若是標題會自動略過。</li>
           <li>對應方式：由上往下，第一條符合協定、來源、目的、埠號的規則，就是這筆 log 命中的規則。沒有命中的 log 會套用你選的預設政策。</li>
+          <li>規則也支援 iptables、Cisco ACL、CSV／Excel 表格、AWS 安全群組格式（用規則輸入框上方的「格式」選單，預設自動偵測）。下面可以一鍵填入各格式的範例。</li>
+          <li>規則輸入框也能直接匯入設定檔：按「匯入設定檔」或把檔案拖進輸入框（iptables-save、Cisco running-config、CSV、AWS describe-security-groups JSON、純文字）。</li>
         </ul>
+        <div class="fmtlist" data-target="mapRules"></div>
         </details>
       </section>
 
@@ -137,10 +149,13 @@
           <div class="panelhead">
             <label for="mapRules"><span class="chip chip-new">規則</span>防火牆規則（順序有意義）</label>
             <div class="mini">
+              <button type="button" class="minibtn" id="impMap">匯入設定檔</button>
               <button type="button" class="minibtn" id="fillRules">填入範例規則</button>
               <button type="button" class="minibtn" id="clearRules">清空內容</button>
             </div>
           </div>
+          <div class="fmtrow"><label for="mapRulesFmt">格式</label><select id="mapRulesFmt" class="fmtsel"><option value="auto" selected>自動偵測</option><option value="simple">簡化寫法</option><option value="iptables">iptables</option><option value="cisco">Cisco ACL</option><option value="csv">CSV／Excel 表格</option><option value="aws">AWS 安全群組</option></select></div>
+          <p class="say importnote" id="mapRulesMsg" role="status" hidden></p>
           <div class="editor">
             <div class="gutter" id="mapRulesGut" aria-hidden="true"></div>
             <div class="editwrap">
@@ -196,6 +211,7 @@
     <p>示範資料中的位址都是虛構的（內部網段與文件保留網段）。本工具只依你貼上的規則做比對，不能取代正式的變更審查或資安事件分析。遮蔽與冗餘分析只檢查「某一條前面的規則是否完整涵蓋它」，不處理多條規則合併後才涵蓋的情況。含逗號的多埠號規則會當成一條規則比對，不會拆成多條。僅供課堂與自學練習。</p>
   </footer>
 </main>
+<input id="ruleFile" type="file" accept=".txt,.conf,.cfg,.config,.rules,.ios,.csv,.json,.log,text/plain,text/csv,application/json" hidden>
 <script src="core.js"></script>
 <script src="script.js"></script>
 </body>

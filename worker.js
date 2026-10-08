@@ -4,7 +4,7 @@ importScripts('core.js');
 self.onmessage = function (e) {
   var d = e.data;
   try {
-    var result = self.FWCore.computeMap(d.rulesText, d.logsText, d.def);
+    var result = self.FWCore.computeMap(d.rulesText, d.logsText, d.def, d.fmt);
     self.postMessage({ id: d.id, ok: true, result: result });
   } catch (err) {
     self.postMessage({ id: d.id, ok: false, error: String(err) });

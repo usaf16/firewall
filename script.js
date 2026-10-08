@@ -106,11 +106,13 @@
   function loadSaved() {
     try { var s = localStorage.getItem(STORE); return s ? JSON.parse(s) : null; } catch (e) { return null; }
   }
+  function fmtOf(id) { var s = $(id + 'Fmt'); return s ? s.value : 'auto'; }
   function save() {
     try {
       localStorage.setItem(STORE, JSON.stringify({
         oldRules: $('oldRules').value, newRules: $('newRules').value,
-        mapRules: $('mapRules').value, mapLogs: $('mapLogs').value, def: $('defPolicy').value
+        mapRules: $('mapRules').value, mapLogs: $('mapLogs').value, def: $('defPolicy').value,
+        fmts: { oldRules: fmtOf('oldRules'), newRules: fmtOf('newRules'), mapRules: fmtOf('mapRules') }
       }));
     } catch (e) { /* 無痕模式或儲存空間已滿（大檔案）時略過 */ }
   }
@@ -147,10 +149,28 @@
     return '';
   }
 
+  // 其他格式（iptables、Cisco、CSV…）的簡易上色：動作、協定、位址、埠號、選項各一種顏色，不畫波浪底線
+  function genericHighlight(container, line) {
+    line.split(/([\s,;]+)/).forEach(function (p) {
+      if (p === '') { return; }
+      if (/^[\s,;]+$/.test(p)) { container.appendChild(document.createTextNode(p)); return; }
+      var t = p.replace(/^["']|["']$/g, ''), cls = '', a = C.actionOf(t);
+      if (a === '允許') { cls = 'tk-allow'; }
+      else if (a === '拒絕') { cls = 'tk-deny'; }
+      else if (/^(tcp|udp|icmp|ip|all|ipv4|ipv6)$/i.test(t)) { cls = 'tk-proto'; }
+      else if (/^(any|\*)$/i.test(t)) { cls = 'tk-any'; }
+      else if (/^[0-9a-f:.]+(\/\d+)?$/i.test(t) && /[.:]/.test(t)) { cls = 'tk-ip'; }
+      else if (/^\d+([-:]\d+)?$/.test(t)) { cls = 'tk-port'; }
+      else if (/^-{1,2}[A-Za-z]/.test(t) || /^(host|eq|range|gt|lt|neq|log|multiport)$/i.test(t)) { cls = 'tk-arrow'; }
+      if (cls) { container.appendChild(el('span', cls, p)); } else { container.appendChild(document.createTextNode(p)); }
+    });
+  }
+
   // 上色層與輸入框逐字對齊，所以只用顏色與底線，不改粗細或斜體。格式錯誤的欄位畫紅色波浪底線。
-  function highlightInto(container, line, kind, vars) {
+  function highlightInto(container, line, kind, vars, fmt, tableMode) {
     var trimmed = line.trim();
-    if (trimmed.charAt(0) === '#') { container.appendChild(el('span', 'tk-cm', line)); return; }
+    if (trimmed.charAt(0) === '#' || (kind === 'rules' && fmt !== 'simple' && trimmed.charAt(0) === '!')) { container.appendChild(el('span', 'tk-cm', line)); return; }
+    if (kind === 'rules' && fmt !== 'simple' && (fmt !== 'auto' || C.guessKind(trimmed, tableMode) !== 'simple')) { genericHighlight(container, line); return; }
     var toks = trimmed ? trimmed.split(/\s+/) : [];
     var idx = 0;
     line.split(/(\s+)/).forEach(function (p) {
@@ -168,6 +188,7 @@
     var hlIn = el('div', 'hl-inner'), gutIn = el('div', 'gut-inner');
     hl.appendChild(hlIn); gut.appendChild(gutIn);
     var lines = [''], bad = {}, wn = {}, vars = {}, win = { a: 0, b: -1 }, marked = 0, lh = 24;
+    var fmt = 'auto', tableMode = null;
     var ed = { onchange: null };
 
     function lineH() { var v = parseFloat(getComputedStyle(ta).lineHeight); if (v > 0) { lh = v; } return lh; }
@@ -179,7 +200,7 @@
         var n = i + 1;
         var cls = (bad[n] ? ' bad' : (wn[n] ? ' warn' : '')) + (n === marked ? ' xhl' : '');
         var d = el('div', 'hl-line' + cls);
-        highlightInto(d, lines[i].replace(/\r$/, ''), kind, vars);
+        highlightInto(d, lines[i].replace(/\r$/, ''), kind, vars, fmt, tableMode);
         fh.appendChild(d);
         fg.appendChild(el('div', 'ln' + cls, String(n)));
       }
@@ -212,12 +233,14 @@
       lines = text.split('\n');
       var L = lines.length;
       vars = kind === 'rules' ? C.scanVars(lines) : {};
+      fmt = kind === 'rules' ? fmtOf(id) : 'auto';
+      tableMode = kind === 'rules' ? (fmt === 'csv' || fmt === 'aws' ? fmt : (fmt === 'auto' ? C.detectTableMode(lines) : null)) : null;
       bad = {}; wn = {};
-      var errs = [], warns = [], count = 0, skipped = L > LINT_MAX;
+      var errs = [], warns = [], count = 0, skipped = L > LINT_MAX, used = [], notes = [];
       if (!skipped) {
         if (kind === 'rules') {
-          var pr = parseRules(text);
-          errs = pr.errors; count = pr.rules.length; warns = analyze(pr.rules);
+          var pr = parseRules(text, fmt);
+          errs = pr.errors; count = pr.rules.length; warns = analyze(pr.rules); used = pr.used; notes = pr.notes;
         } else {
           var pl = parseLogs(text);
           errs = pl.errors; count = pl.logs.length;
@@ -234,6 +257,11 @@
         lint.appendChild(el('p', 'lint-hint', '共 ' + L.toLocaleString('en-US') + ' 行，已略過逐行即時檢查（語法上色與波浪底線仍會顯示）。按「' + (kind === 'rules' ? '比對' : '對應') + '」會完整解析並回報錯誤。'));
         return;
       }
+      if (kind === 'rules' && used.length) {
+        var names = used.map(function (u) { return C.FORMAT_NAMES[u] || u; }).join('、');
+        lint.appendChild(el('p', 'lint-hint', '辨識格式：' + names + (fmt === 'auto' ? '（自動偵測）' : '（手動指定）')));
+      }
+      notes.forEach(function (n) { lint.appendChild(el('p', 'lint-hint', n)); });
       if (!errs.length && !warns.length) {
         lint.appendChild(el('p', 'lint-ok', '✓ 語法檢查通過，共 ' + count + (kind === 'rules' ? ' 條規則。' : ' 筆 log。')));
         return;
@@ -275,6 +303,8 @@
       timer = setTimeout(function () { refresh(); save(); if (ed.onchange) { ed.onchange(); } }, 150);
     });
     ta.addEventListener('scroll', function () { sync(false); });
+    var fsel = $(id + 'Fmt');
+    if (fsel) { fsel.addEventListener('change', function () { refresh(); save(); if (ed.onchange) { ed.onchange(); } }); }
     if (window.ResizeObserver) { new ResizeObserver(function () { fit(); sync(false); }).observe(ta); }
     ed.refresh = refresh; ed.mark = mark; ed.focusLine = focusLine;
     ED[id] = ed;
@@ -343,12 +373,64 @@
   /* =========================================================
      六、分頁一：規則比對
      ========================================================= */
+  // 各格式的範例（內容是同一批虛構規則的不同寫法）
+  var FORMAT_SAMPLES = [
+    { fmt: 'iptables', label: 'iptables', text: [
+      '# iptables 範例（虛構）',
+      '-A INPUT -p tcp -s 10.0.0.0/24 -d 192.168.1.20 --dport 22 -j DROP',
+      '-A INPUT -p tcp -d 192.168.1.10 -m multiport --dports 80,443 -j ACCEPT',
+      '-A INPUT -p udp -s 10.0.0.0/24 -d 192.168.1.53 --dport 53 -j ACCEPT',
+      '-A INPUT -p icmp -j ACCEPT',
+      '-A INPUT -p tcp --dport 23 -j DROP'].join('\n') },
+    { fmt: 'cisco', label: 'Cisco ACL', text: [
+      '! Cisco ACL 範例（虛構）',
+      'access-list 101 deny tcp 10.0.0.0 0.0.0.255 host 192.168.1.20 eq 22',
+      'access-list 101 permit tcp any host 192.168.1.10 eq 80 443',
+      'access-list 101 permit udp 10.0.0.0 0.0.0.255 host 192.168.1.53 eq domain',
+      'access-list 101 permit icmp any any',
+      'access-list 101 deny tcp any any eq telnet'].join('\n') },
+    { fmt: 'csv', label: 'CSV／Excel 表格', text: [
+      '動作,協定,來源,目的,埠號',
+      'deny,tcp,10.0.0.0/24,192.168.1.20,22',
+      'allow,tcp,any,192.168.1.10,"80,443"',
+      'allow,udp,10.0.0.0/24,192.168.1.53,53',
+      'allow,icmp,any,any,any',
+      'deny,tcp,any,any,23'].join('\n') },
+    { fmt: 'aws', label: 'AWS 安全群組', text: [
+      'Type,Protocol,Port range,Source',
+      'HTTPS,TCP,443,0.0.0.0/0',
+      'SSH,TCP,22,10.0.0.0/24',
+      'Custom UDP,UDP,53,10.0.0.0/24',
+      'All ICMP - IPv4,ICMP,All,0.0.0.0/0'].join('\n') }
+  ];
+  function buildFormatLists() {
+    Array.prototype.forEach.call(document.querySelectorAll('.fmtlist'), function (box) {
+      var target = box.dataset.target;
+      FORMAT_SAMPLES.forEach(function (s) {
+        var item = el('div', 'fmtitem');
+        var head = el('div', 'fmthead');
+        head.appendChild(el('strong', '', s.label));
+        var b = el('button', 'minibtn', '填入「' + (target === 'mapRules' ? '規則' : '新版') + '」輸入框');
+        b.type = 'button';
+        b.addEventListener('click', function () {
+          $(target + 'Fmt').value = s.fmt;
+          setVal(target, s.text);
+          if (target === 'mapRules') { renderMap(); } else { renderDiff(); }
+        });
+        head.appendChild(b);
+        item.appendChild(head);
+        item.appendChild(el('pre', 'fmtpre', s.text));
+        box.appendChild(item);
+      });
+    });
+  }
+
   var DS = { entries: null, view: 'side', showSame: false };
 
   function renderDiff() {
     var box = $('result');
     box.textContent = '';
-    var o = parseRules($('oldRules').value), n = parseRules($('newRules').value);
+    var o = parseRules($('oldRules').value, fmtOf('oldRules')), n = parseRules($('newRules').value, fmtOf('newRules'));
     if (!o.rules.length && !n.rules.length && !o.errors.length && !n.errors.length) {
       DS.entries = null;
       $('diffTools').hidden = true;
@@ -497,12 +579,12 @@
     } catch (e) { W.bad = true; W.w = null; }
     return W.w;
   }
-  function computeMapAsync(rulesText, logsText, def, cb) {
+  function computeMapAsync(rulesText, logsText, def, fmt, cb) {
     var w = logsText.length > BIG_CHARS ? getWorker() : null;
-    if (!w) { cb(C.computeMap(rulesText, logsText, def)); return; }
+    if (!w) { cb(C.computeMap(rulesText, logsText, def, fmt)); return; }
     W.id++;
-    W.cb = function (res) { if (res) { cb(res); } else { setTimeout(function () { cb(C.computeMap(rulesText, logsText, def)); }, 0); } };
-    w.postMessage({ id: W.id, rulesText: rulesText, logsText: logsText, def: def });
+    W.cb = function (res) { if (res) { cb(res); } else { setTimeout(function () { cb(C.computeMap(rulesText, logsText, def, fmt)); }, 0); } };
+    w.postMessage({ id: W.id, rulesText: rulesText, logsText: logsText, def: def, fmt: fmt });
   }
 
   function renderMap() {
@@ -516,7 +598,7 @@
       box.setAttribute('aria-busy', 'true');
       box.appendChild(el('p', 'panel loading', '正在處理約 ' + Math.round(logsText.length / 1024).toLocaleString('en-US') + ' KB 的 log…（在背景計算，畫面不會卡住）'));
     }
-    computeMapAsync(rulesText, logsText, def, function (res) {
+    computeMapAsync(rulesText, logsText, def, fmtOf('mapRules'), function (res) {
       if (job !== MS.job) { return; }
       box.removeAttribute('aria-busy');
       finishMap(res, def);
@@ -775,6 +857,95 @@
   }
 
   /* =========================================================
+     八之二、匯入規則設定檔（iptables-save、Cisco running-config、CSV、AWS JSON、簡化寫法純文字）
+     ========================================================= */
+  // Cisco running-config 含 hostname、interface 等雜行，只擷取 ACL 的部分
+  function extractCisco(text) {
+    var hasAcl = /^(ip\s+access-list|access-list\s+\S+\s+(permit|deny|remark))/mi.test(text);
+    var isConfig = /^(hostname|interface|version|ip route|line|router|snmp-server|service|enable|username)\b/m.test(text);
+    if (!hasAcl || !isConfig) { return null; }
+    var out = [], names = {}, inBlock = false;
+    text.split(/\r?\n/).forEach(function (raw) {
+      var m = /^(ip|ipv6)\s+access-list\s+(?:extended\s+|standard\s+)?(\S+)/i.exec(raw);
+      if (m) { inBlock = m[1].toLowerCase() === 'ip'; if (inBlock) { names[m[2]] = true; out.push('! ' + raw.trim()); } return; }
+      if (/^access-list\s+\S+\s+/i.test(raw)) { names[raw.trim().split(/\s+/)[1]] = true; out.push(raw); inBlock = false; return; }
+      if (inBlock && /^\s+\S/.test(raw)) { out.push(raw); return; }
+      inBlock = false;
+    });
+    return { text: out.join('\n'), names: Object.keys(names) };
+  }
+
+  // AWS CLI：aws ec2 describe-security-groups 的 JSON 輸出（只取入站規則）
+  function awsJsonToText(text) {
+    var d;
+    try { d = JSON.parse(text); } catch (e) { return null; }
+    var groups = d && d.SecurityGroups ? d.SecurityGroups : (Array.isArray(d) && d[0] && d[0].IpPermissions ? d : null);
+    if (!groups) { return null; }
+    var out = ['Type,Protocol,Port range,Source'];
+    groups.forEach(function (g) {
+      out.push('# ' + (g.GroupId || '') + ' ' + (g.GroupName || '') + (g.Description ? ' - ' + g.Description : ''));
+      (g.IpPermissions || []).forEach(function (p) {
+        var proto = String(p.IpProtocol), port;
+        if (proto === '-1') { proto = 'All'; port = 'All'; }
+        else if (p.FromPort === undefined || p.FromPort === null || p.FromPort === -1) { port = 'All'; }
+        else { port = p.FromPort === p.ToPort ? String(p.FromPort) : p.FromPort + '-' + p.ToPort; }
+        var srcs = [];
+        (p.IpRanges || []).forEach(function (r) { srcs.push(r.CidrIp); });
+        (p.Ipv6Ranges || []).forEach(function (r) { srcs.push(r.CidrIpv6); });
+        (p.UserIdGroupPairs || []).forEach(function (r) { srcs.push(r.GroupId || 'sg-?'); });
+        (p.PrefixListIds || []).forEach(function (r) { srcs.push(r.PrefixListId); });
+        srcs.forEach(function (s) { out.push(['Custom', proto, port, s].join(',')); });
+      });
+    });
+    return { text: out.join('\n'), count: groups.length };
+  }
+
+  function importRulesFile(file, id) {
+    if (!file) { return; }
+    var msg = $(id + 'Msg');
+    var show = function (t, bad) { msg.hidden = false; msg.textContent = t; msg.style.color = bad ? 'var(--del)' : 'var(--muted)'; };
+    if (file.size > MAX_BYTES) { show('檔案太大（' + (file.size / 1048576).toFixed(1) + ' MB），請拆成 8 MB 以內再匯入。', true); return; }
+    var okName = /\.(txt|conf|cfg|config|rules|ios|csv|json|log|v4|v6)$/i.test(file.name) || /^[^.]+$/.test(file.name) || file.type.indexOf('text/') === 0 || file.type === 'application/json';
+    if (!okName) { show('只支援文字類的設定檔（.txt、.conf、.cfg、.rules、.csv、.json 等），「' + file.name + '」不是。', true); return; }
+    var reader = new FileReader();
+    reader.onerror = function () { show('讀取「' + file.name + '」失敗，請再試一次。', true); };
+    reader.onload = function () {
+      var text = String(reader.result).replace(/^﻿/, '');
+      if (text.indexOf('\u0000') >= 0) { show('「' + file.name + '」看起來是二進位檔，不是文字設定檔。', true); return; }
+      var note = '', fmt = 'auto';
+      var js = /^\s*[\[{]/.test(text) ? awsJsonToText(text) : null;
+      if (js) {
+        text = js.text; fmt = 'aws';
+        note = '，偵測到 AWS describe-security-groups JSON（' + js.count + ' 個安全群組，只取入站規則，已轉成表格）';
+      } else {
+        var cx = extractCisco(text);
+        if (cx) {
+          text = cx.text;
+          note = '，偵測到 Cisco 設定檔，已只擷取 ' + cx.names.length + ' 個 ACL（' + cx.names.slice(0, 5).join('、') + (cx.names.length > 5 ? '…' : '') + '）';
+        }
+      }
+      $(id + 'Fmt').value = fmt;
+      setVal(id, text);
+      var n = 0;
+      text.split(/\r?\n/).forEach(function (l) { var t = l.trim(); if (t && t.charAt(0) !== '#' && t.charAt(0) !== '!') { n++; } });
+      show('已匯入「' + file.name + '」，共 ' + n.toLocaleString('en-US') + ' 行內容' + note + '。檔案只在你的瀏覽器內處理，沒有上傳。', false);
+      if (id === 'mapRules') { renderMap(); } else { renderDiff(); }
+    };
+    reader.readAsText(file);
+  }
+
+  // 拖放檔案到輸入框（只攔截檔案；拖文字進來仍照一般方式貼上）
+  function enableFileDrop(taId, handler) {
+    var ta = $(taId);
+    ta.addEventListener('dragover', function (e) {
+      if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0) { e.preventDefault(); }
+    });
+    ta.addEventListener('drop', function (e) {
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) { e.preventDefault(); handler(e.dataTransfer.files[0]); }
+    });
+  }
+
+  /* =========================================================
      九、事件與初始化
      ========================================================= */
   function showTab(which) {
@@ -836,6 +1007,7 @@
     b.textContent = '清除暫存並還原範例';
     $('defPolicy').value = 'deny';
     $('importMsg').hidden = true;
+    ['oldRules', 'newRules', 'mapRules'].forEach(function (k) { $(k + 'Fmt').value = 'auto'; });
     setVal('oldRules', SAMPLE_A); setVal('newRules', SAMPLE_B);
     setVal('mapRules', SAMPLE_RULES); setVal('mapLogs', SAMPLE_LOGS);
     try { localStorage.removeItem(STORE); } catch (e) { /* 略過 */ }
@@ -865,7 +1037,7 @@
   $('clearRules').addEventListener('click', function () { setVal('mapRules', ''); renderMap(); });
   $('clearLogs').addEventListener('click', function () { setVal('mapLogs', ''); $('importMsg').hidden = true; renderMap(); });
   $('mapSampleBtn').addEventListener('click', function () { setVal('mapRules', SAMPLE_RULES); setVal('mapLogs', SAMPLE_LOGS); renderMap(); });
-  $('useNewBtn').addEventListener('click', function () { setVal('mapRules', $('newRules').value); renderMap(); });
+  $('useNewBtn').addEventListener('click', function () { $('mapRulesFmt').value = fmtOf('newRules'); setVal('mapRules', $('newRules').value); renderMap(); });
   $('mapClearBtn').addEventListener('click', function () {
     setVal('mapRules', ''); setVal('mapLogs', '');
     $('importMsg').hidden = true; renderMap();
@@ -873,16 +1045,27 @@
   $('defPolicy').addEventListener('change', function () { save(); renderMap(); });
   $('importBtn').addEventListener('click', function () { $('logFile').click(); });
   $('logFile').addEventListener('change', function () { importLogFile(this.files && this.files[0]); this.value = ''; });
-  $('mapLogs').addEventListener('dragover', function (e) { e.preventDefault(); });
-  $('mapLogs').addEventListener('drop', function (e) {
-    e.preventDefault();
-    importLogFile(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]);
+  enableFileDrop('mapLogs', importLogFile);
+
+  // 匯入規則設定檔：三個規則輸入框共用一個檔案選擇器
+  var pendingRuleTarget = 'newRules';
+  [['impOld', 'oldRules'], ['impNew', 'newRules'], ['impMap', 'mapRules']].forEach(function (p) {
+    $(p[0]).addEventListener('click', function () { pendingRuleTarget = p[1]; $('ruleFile').click(); });
+    enableFileDrop(p[1], function (f) { importRulesFile(f, p[1]); });
   });
+  $('ruleFile').addEventListener('change', function () { importRulesFile(this.files && this.files[0], pendingRuleTarget); this.value = ''; });
 
   // 開啟頁面：優先回填上次暫存的內容，沒有才載入示範資料
   var saved = loadSaved();
   var pick = function (k, dflt) { return saved && typeof saved[k] === 'string' ? saved[k] : dflt; };
   if (saved && (saved.def === 'allow' || saved.def === 'deny')) { $('defPolicy').value = saved.def; }
+  if (saved && saved.fmts) {
+    ['oldRules', 'newRules', 'mapRules'].forEach(function (k) {
+      var v = saved.fmts[k];
+      if (typeof v === 'string' && $(k + 'Fmt').querySelector('option[value="' + v + '"]')) { $(k + 'Fmt').value = v; }
+    });
+  }
+  buildFormatLists();
   setVal('oldRules', pick('oldRules', SAMPLE_A));
   setVal('newRules', pick('newRules', SAMPLE_B));
   setVal('mapRules', pick('mapRules', SAMPLE_RULES));

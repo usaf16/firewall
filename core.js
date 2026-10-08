@@ -207,10 +207,268 @@
     };
   }
 
+  /* ---------- 其他規則格式：逐行轉成簡化寫法，後面的比對與分析都不用改 ---------- */
+  var FORMAT_NAMES = { simple: '簡化寫法', iptables: 'iptables', cisco: 'Cisco ACL', csv: 'CSV 表格', aws: 'AWS 安全群組' };
+  var CISCO_PORTS = { www: 80, https: 443, ftp: 21, 'ftp-data': 20, telnet: 23, smtp: 25, domain: 53, ssh: 22, pop3: 110, imap4: 143, snmp: 161, ntp: 123, sunrpc: 111, bgp: 179, ldap: 389, ldaps: 636, syslog: 514, tftp: 69, sip: 5060 };
+  function namedPort(tok) {
+    var t = tok.toLowerCase();
+    if (/^\d+$/.test(t)) { return Number(t); }
+    if (has(CISCO_PORTS, t)) { return CISCO_PORTS[t]; }
+    var u = tok.toUpperCase();
+    return has(SERVICES, u) ? SERVICES[u] : null;
+  }
+  function shellSplit(s) {
+    var out = [], cur = '', q = null;
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (q) { if (ch === q) { q = null; } else { cur += ch; } }
+      else if (ch === '"' || ch === "'") { q = ch; }
+      else if (/\s/.test(ch)) { if (cur !== '') { out.push(cur); cur = ''; } }
+      else { cur += ch; }
+    }
+    if (cur !== '') { out.push(cur); }
+    return out;
+  }
+  function protoWord(v) {
+    var s = String(v).trim().toLowerCase();
+    if (s === '' || s === '*' || s === 'all' || s === 'any' || s === 'ip' || s === '-1' || s === 'all traffic' || s === 'all protocols' || s === '任意') { return ANY; }
+    if (s === 'tcp' || s === '6') { return 'TCP'; }
+    if (s === 'udp' || s === '17') { return 'UDP'; }
+    if (s === 'icmp' || s === '1' || s === 'icmpv4' || s === 'all icmp - ipv4') { return 'ICMP'; }
+    return null;
+  }
+
+  var IPT_RE = /^\s*(ip6?tables(?:-legacy|-nft)?\s+)?(-[AIRPNFXZt]\b|--(append|insert|policy|table)\b)/;
+  var IPT_SAVE_RE = /^(\*\w+|:[A-Z]+\s|COMMIT\b)/;
+  var CISCO_RE = /^(access-list\s+\S+\s+|ip\s+access-list\s|ipv6\s+access-list\s|(\d+\s+)?(permit|deny|remark)\s|!)/i;
+
+  function convertIptables(line, ctx) {
+    var l = line.replace(/^\s*ip6?tables(?:-legacy|-nft)?\s+/i, '');
+    // iptables-save 的輸出分成多個表（*filter、*nat…），只處理 filter 表
+    var tm = /^\*(\w+)/.exec(l);
+    if (tm) { ctx.table = tm[1]; return { skip: true }; }
+    if (/^COMMIT\b/i.test(l)) { ctx.table = null; return { skip: true }; }
+    if (IPT_SAVE_RE.test(l)) { return { skip: true }; }
+    if (ctx.table && ctx.table !== 'filter') {
+      ctx.skippedTbl[ctx.table] = (ctx.skippedTbl[ctx.table] || 0) + 1;
+      return { skip: true };
+    }
+    var t = shellSplit(l), i = 0;
+    if (t[0] === '-t' || t[0] === '--table') {
+      if ((t[1] || '') !== 'filter') { return { error: '只支援 filter 表的規則（目前是「' + (t[1] || '') + '」）。' }; }
+      i = 2;
+    }
+    var op = t[i];
+    if (op === '-P' || op === '--policy' || op === '-N' || op === '-F' || op === '-X' || op === '-Z') { return { skip: true }; }
+    if (op === '-I' || op === '--insert') { return { error: '不支援 -I（插入）：插入會改變順序，請先整理成 -A（附加）的順序再貼上。' }; }
+    if (op !== '-A' && op !== '--append') { return { error: '只支援 -A（附加）規則，目前是「' + (op || '') + '」。' }; }
+    if (!t[i + 1]) { return { error: '-A 後面要接鏈名稱（如 INPUT）。' }; }
+    ctx.chains[t[i + 1]] = true;
+    var proto = ANY, src = ANY, dst = ANY, port = ANY, target = '';
+    for (i += 2; i < t.length; i++) {
+      var o = t[i], v;
+      if (o === '!') { return { error: '不支援「!」（否定）條件。' }; }
+      if (o === '-p' || o === '--protocol') {
+        v = t[++i]; var pw = v === undefined ? null : protoWord(v);
+        if (pw === null) { return { error: '不支援的協定「' + v + '」，只支援 tcp、udp、icmp、all。' }; }
+        proto = pw;
+      } else if (o === '-s' || o === '--source' || o === '--src') { src = t[++i]; if (src === undefined) { return { error: o + ' 後面缺少位址。' }; } }
+      else if (o === '-d' || o === '--destination' || o === '--dst') { dst = t[++i]; if (dst === undefined) { return { error: o + ' 後面缺少位址。' }; } }
+      else if (o === '--dport' || o === '--destination-port' || o === '--dports' || o === '--destination-ports') {
+        v = t[++i]; if (v === undefined) { return { error: o + ' 後面缺少埠號。' }; }
+        port = v.replace(/:/g, '-');
+      } else if (o === '-m' || o === '--match') {
+        v = t[++i];
+        if (v === 'tcp' || v === 'udp' || v === 'multiport') { continue; }
+        if (v === 'comment') { if (t[i + 1] === '--comment') { i += 2; } continue; }
+        return { error: '不支援 -m ' + v + ' 條件（只支援 tcp、udp、multiport、comment）。' };
+      } else if (o === '--comment') { i++; }
+      else if (o === '-j' || o === '-g' || o === '--jump' || o === '--goto') { target = (t[++i] || '').toUpperCase(); }
+      else if (o === '-c' || o === '--set-counters') { i += 2; }
+      else if (o === '--sport' || o === '--source-port' || o === '--sports' || o === '--source-ports') { return { error: '不支援來源埠號（' + o + '），本工具只比對目的埠號。' }; }
+      else if (o === '-i' || o === '--in-interface' || o === '-o' || o === '--out-interface') { return { error: '不支援網路介面條件（' + o + '）。' }; }
+      else { return { error: '不支援的選項「' + o + '」。' }; }
+    }
+    var action = target === 'ACCEPT' ? '允許' : (target === 'DROP' || target === 'REJECT' ? '拒絕' : '');
+    if (!action) { return { error: '目標（-j）必須是 ACCEPT、DROP 或 REJECT，目前是「' + target + '」。' }; }
+    if (port !== ANY && proto !== 'TCP' && proto !== 'UDP') { return { error: '指定埠號時必須搭配 -p tcp 或 -p udp。' }; }
+    return { simple: action + ' ' + proto + ' ' + src + ' -> ' + dst + ' ' + port };
+  }
+
+  function wildcardAddr(addr, wc) {
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(wc)) { return null; }
+    var w = ipToInt(wc);
+    if (w === 0xFFFFFFFF) { return ANY; }
+    var n = w + 1;
+    if ((n & w) !== 0) { return null; }
+    return addr + '/' + (32 - Math.round(Math.log(n) / Math.LN2));
+  }
+
+  function convertCisco(line) {
+    var l = line.trim();
+    if (l.charAt(0) === '!' || /^(ip\s+access-list|ipv6\s+access-list)\b/i.test(l) || /^(access-list\s+\S+\s+)?(\d+\s+)?remark\b/i.test(l)) { return { skip: true }; }
+    l = l.replace(/^access-list\s+\S+\s+/i, '').replace(/^\d+\s+(?=(permit|deny)\b)/i, '');
+    var t = l.split(/\s+/), p = 0;
+    var act = (t[p++] || '').toLowerCase();
+    if (act !== 'permit' && act !== 'deny') { return { error: '無法辨識的 Cisco ACL 行（應以 permit 或 deny 開頭）。' }; }
+    var action = act === 'permit' ? '允許' : '拒絕';
+    var proto = ANY, std = false;
+    var first = (t[p] || '').toLowerCase();
+    if (first === 'ip' || first === 'tcp' || first === 'udp' || first === 'icmp') { proto = protoWord(first); p++; }
+    else if (first === 'any' || first === 'host' || /^\d+\.\d+\.\d+\.\d+$/.test(first)) { std = true; }
+    else { return { error: '不支援的協定「' + t[p] + '」，只支援 ip、tcp、udp、icmp。' }; }
+    function addr() {
+      var a = t[p++];
+      if (a === undefined) { return { error: '缺少位址。' }; }
+      if (a.toLowerCase() === 'any') { return { v: ANY }; }
+      if (a.toLowerCase() === 'host') { var h = t[p++]; return h ? { v: h } : { error: 'host 後面缺少位址。' }; }
+      if (!/^\d+\.\d+\.\d+\.\d+$/.test(a)) { return { error: '不支援的位址「' + a + '」（只支援 any、host、位址 + 萬用遮罩）。' }; }
+      var wc = t[p];
+      if (wc !== undefined && /^\d+\.\d+\.\d+\.\d+$/.test(wc)) {
+        p++;
+        var cidr = wildcardAddr(a, wc);
+        return cidr === null ? { error: '萬用遮罩「' + wc + '」不是連續的，無法轉成網段。' } : { v: cidr };
+      }
+      return std ? { v: a } : { error: '位址「' + a + '」後面缺少萬用遮罩。' };
+    }
+    var s = addr(); if (s.error) { return { error: '來源：' + s.error }; }
+    var d = { v: ANY };
+    var ops = /^(eq|range|gt|lt|neq)$/i;
+    if (!std) {
+      if (t[p] !== undefined && ops.test(t[p])) { return { error: '不支援來源埠號條件，本工具只比對目的埠號。' }; }
+      d = addr(); if (d.error) { return { error: '目的：' + d.error }; }
+    }
+    var port = ANY;
+    if (t[p] !== undefined && ops.test(t[p])) {
+      if (proto !== 'TCP' && proto !== 'UDP') { return { error: '埠號條件只能搭配 tcp 或 udp。' }; }
+      var op = t[p++].toLowerCase();
+      if (op === 'eq') {
+        var list = [];
+        while (t[p] !== undefined && namedPort(t[p]) !== null) { list.push(namedPort(t[p++])); }
+        if (!list.length) { return { error: 'eq 後面缺少有效的埠號。' }; }
+        port = list.join(',');
+      } else if (op === 'range') {
+        var a1 = namedPort(t[p] || ''), a2 = namedPort(t[p + 1] || '');
+        if (a1 === null || a2 === null) { return { error: 'range 後面需要兩個有效的埠號。' }; }
+        p += 2; port = a1 + '-' + a2;
+      } else if (op === 'gt' || op === 'lt') {
+        var n = namedPort(t[p++] || '');
+        if (n === null) { return { error: op + ' 後面缺少有效的埠號。' }; }
+        port = op === 'gt' ? (n + 1) + '-65535' : '1-' + (n - 1);
+      } else { return { error: '不支援 neq（不等於）條件。' }; }
+    }
+    for (; p < t.length; p++) {
+      var w = t[p].toLowerCase();
+      if (w === 'log' || w === 'log-input') { continue; }
+      return { error: '不支援的選項「' + t[p] + '」（只支援 log 與 log-input）。' };
+    }
+    return { simple: action + ' ' + proto + ' ' + s.v + ' -> ' + d.v + ' ' + port };
+  }
+
+  // CSV / Excel 貼上 / AWS 安全群組表格
+  var HDR = {
+    action: /^(action|動作|policy|permission|allow\/deny)$/i,
+    proto: /^(ip\s*protocol|protocol|proto|協定)$/i,
+    src: /^(source|src|source\s*ip|source\s*address|來源)$/i,
+    dst: /^(destination|dst|dest|destination\s*ip|destination\s*address|目的)$/i,
+    port: /^(port|ports|dport|dst\s*port|destination\s*port|port\s*range|埠號|埠)$/i,
+    type: /^type$/i
+  };
+  function splitCells(line) {
+    var delim = line.indexOf('\t') >= 0 ? '\t' : ',';
+    var cells = [], cur = '', q = false;
+    for (var i = 0; i < line.length; i++) {
+      var ch = line.charAt(i);
+      if (q) { if (ch === '"') { if (line.charAt(i + 1) === '"') { cur += '"'; i++; } else { q = false; } } else { cur += ch; } }
+      else if (ch === '"') { q = true; }
+      else if (ch === delim) { cells.push(cur); cur = ''; }
+      else { cur += ch; }
+    }
+    cells.push(cur);
+    return cells;
+  }
+  function headerMap(cells) {
+    var map = {}, n = 0;
+    cells.forEach(function (c, i) {
+      Object.keys(HDR).forEach(function (k) { if (map[k] === undefined && HDR[k].test(c.trim())) { map[k] = i; n++; } });
+    });
+    return n >= 2 ? map : null;
+  }
+  // Cisco 的行：明確的 access-list／註解行，或沒有逗號與 Tab 的 permit／deny 行（有分隔符號的 deny,tcp,… 是 CSV 資料列）
+  function ciscoLine(s) {
+    return /^(access-list\s|(ip|ipv6)\s+access-list|!|(\d+\s+)?remark\s)/i.test(s) || (!/[\t,]/.test(s) && CISCO_RE.test(s));
+  }
+  function otherKind(line) {
+    return /\s(->|→)\s/.test(line) || line.charAt(0) === '$' || IPT_RE.test(line) || IPT_SAVE_RE.test(line) || ciscoLine(line);
+  }
+  // 判斷整份文字是不是表格（CSV 或 AWS 安全群組）
+  function detectTableMode(rawLines) {
+    var seen = 0;
+    for (var i = 0; i < rawLines.length && seen < 40; i++) {
+      var s = rawLines[i].trim();
+      if (!s || s.charAt(0) === '#' || s.charAt(0) === '!') { continue; }
+      seen++;
+      if (otherKind(s) || !/[\t,]/.test(s)) { continue; }
+      var cells = splitCells(s);
+      if (cells.length < 3) { continue; }
+      var hm = headerMap(cells);
+      if (hm) {
+        if (hm.action !== undefined || hm.dst !== undefined) { return 'csv'; }
+        return hm.proto !== undefined && hm.port !== undefined && hm.src !== undefined ? 'aws' : 'csv';
+      }
+      return actionOf(cells[0].trim()) ? 'csv' : 'aws';
+    }
+    return null;
+  }
+  function guessKind(line, tableMode) {
+    if (/\s(->|→)\s/.test(line) || line.charAt(0) === '$') { return 'simple'; }
+    if (IPT_RE.test(line) || IPT_SAVE_RE.test(line)) { return 'iptables'; }
+    if (ciscoLine(line)) { return 'cisco'; }
+    return tableMode || 'simple';
+  }
+  function convertTable(line, ctx, mode) {
+    var cells = splitCells(line);
+    if (!ctx.cols) {
+      var hm = headerMap(cells);
+      if (hm) { ctx.cols = hm; return { skip: true }; }
+      ctx.cols = mode === 'aws' ? (cells.length >= 4 ? { type: 0, proto: 1, port: 2, src: 3 } : { proto: 0, port: 1, src: 2 }) : { action: 0, proto: 1, src: 2, dst: 3, port: 4 };
+    }
+    var c = ctx.cols;
+    var cell = function (k) { return c[k] !== undefined && c[k] < cells.length ? cells[c[k]].trim() : ''; };
+    var action, proto, dst, src = cell('src').replace(/\s+/g, ''), port = cell('port').replace(/\s+/g, '').replace(/[;|]/g, ',').replace(/:/g, '-');
+    if (mode === 'aws') {
+      action = '允許'; dst = ANY;
+      if (/^(sg|pl)-/i.test(src)) { return { error: '不支援以安全群組或前綴清單（' + src + '）當來源，請改用 CIDR 位址。' }; }
+    } else {
+      action = actionOf(cell('action'));
+      if (!action) { return { error: '動作必須是允許／拒絕（或 allow、deny 等），目前是「' + cell('action') + '」。' }; }
+      dst = cell('dst').replace(/\s+/g, '');
+    }
+    proto = protoWord(cell('proto'));
+    if (proto === null) { return { error: '不支援的協定「' + cell('proto') + '」，只支援 TCP、UDP、ICMP、任意。' }; }
+    var pl = port.toLowerCase();
+    if (pl === '' || pl === '*' || pl === 'all' || pl === 'any' || pl === 'n/a' || pl === 'na' || pl === '-' || pl === '任意' || pl === '0-65535') { port = ANY; }
+    if (mode === 'aws' && proto === 'ICMP') { port = ANY; }
+    if (src === '' || src === '*') { src = ANY; }
+    if (dst === '' || dst === '*') { dst = ANY; }
+    return { simple: action + ' ' + proto + ' ' + src + ' -> ' + dst + ' ' + port };
+  }
+
+  function convertLine(kind, line, ctx, tableMode) {
+    if (kind === 'iptables') { return convertIptables(line, ctx); }
+    if (kind === 'cisco') { return convertCisco(line); }
+    if (kind === 'csv' || kind === 'aws') { return convertTable(line, ctx, kind); }
+    return { simple: line };
+  }
+
   // 規則順序有意義：保留全部有效規則，no = 第幾條有效規則，line = 原始行號。$變數定義行不算規則。
-  function parseRules(text) {
-    var rules = [], errors = [], vars = {};
-    text.split(/\r?\n/).forEach(function (raw, i) {
+  // fmt：auto（自動偵測）、simple、iptables、cisco、csv、aws
+  function parseRules(text, fmt) {
+    fmt = fmt || 'auto';
+    var rules = [], errors = [], vars = {}, used = {}, ctx = { cols: null, chains: {}, table: null, skippedTbl: {} };
+    var rawLines = text.split(/\r?\n/);
+    var tableMode = fmt === 'csv' || fmt === 'aws' ? fmt : (fmt === 'auto' ? detectTableMode(rawLines) : null);
+    rawLines.forEach(function (raw, i) {
       var line = raw.trim();
       if (!line || line.charAt(0) === '#') { return; }
       if (line.charAt(0) === '$') {
@@ -218,13 +476,21 @@
         if (d.error) { errors.push({ n: i + 1, text: line, msg: d.error }); }
         return;
       }
-      var r = parseRuleLine(line, vars);
-      if (r.error) { errors.push({ n: i + 1, text: line, msg: r.error }); return; }
+      var kind = fmt === 'auto' ? guessKind(line, tableMode) : fmt;
+      var conv = convertLine(kind, line, ctx, tableMode);
+      if (conv.skip) { return; }
+      used[kind] = true;
+      if (conv.error) { errors.push({ n: i + 1, text: line, msg: conv.error }); return; }
+      var r = parseRuleLine(conv.simple, vars);
+      if (r.error) { errors.push({ n: i + 1, text: line, msg: r.error + (kind === 'simple' ? '' : '（轉換後：' + conv.simple + '）') }); return; }
       r.rule.line = i + 1;
       r.rule.no = rules.length + 1;
       rules.push(r.rule);
     });
-    return { rules: rules, errors: errors, vars: vars };
+    var notes = [], chains = Object.keys(ctx.chains);
+    Object.keys(ctx.skippedTbl).forEach(function (tb) { notes.push('已略過 ' + ctx.skippedTbl[tb] + ' 行 ' + tb + ' 表的規則（只處理 filter 表）。'); });
+    if (chains.length > 1) { notes.push('iptables 規則來自 ' + chains.length + ' 個鏈（' + chains.join('、') + '），本工具不區分鏈，會依出現順序合併比對。'); }
+    return { rules: rules, errors: errors, vars: vars, used: Object.keys(used), notes: notes, tableMode: tableMode };
   }
   // 只掃變數定義（行數很多時，給輸入框上色用）
   function scanVars(lines) {
@@ -348,8 +614,8 @@
   }
 
   // 規則與 log 對應（可在 Web Worker 內執行）
-  function computeMap(rulesText, logsText, defAction) {
-    var rp = parseRules(rulesText), lp = parseLogs(logsText);
+  function computeMap(rulesText, logsText, defAction, fmt) {
+    var rp = parseRules(rulesText, fmt), lp = parseLogs(logsText);
     var rules = rp.rules, rows = new Array(lp.logs.length);
     for (var k = 0; k < lp.logs.length; k++) {
       var lg = lp.logs[k], found = null;
@@ -439,7 +705,7 @@
   }
 
   root.FWCore = {
-    ANY: ANY, isAny: isAny, actionOf: actionOf,
+    ANY: ANY, isAny: isAny, actionOf: actionOf, FORMAT_NAMES: FORMAT_NAMES, detectTableMode: detectTableMode, guessKind: guessKind,
     parseRules: parseRules, parseLogs: parseLogs, scanVars: scanVars, tokenBad: tokenBad,
     analyze: analyze, warnText: warnText, computeMap: computeMap, buildDiff: buildDiff,
     disp: disp, ruleText: ruleText, plain: plain, cidrInfo: cidrInfo
