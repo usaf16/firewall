@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>防火牆規則比對</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=Noto+Serif+TC:wght@600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="hero-head">
+      <img src="images/logo.svg" alt="盾牌圖示" width="56" height="56">
+      <div>
+        <h1>防火牆規則比對</h1>
+        <p class="sub">比對新舊規則的差異，也能把連線紀錄（log）對應到命中的規則。所有處理都在你的瀏覽器內完成，不會上傳資料。</p>
+      </div>
+    </div>
+  </header>
+
+  <div class="tabbar" role="tablist" aria-label="功能">
+    <button id="tabDiff" class="tabbtn" type="button" role="tab" aria-selected="true" aria-controls="viewDiff">規則比對</button>
+    <button id="tabLog" class="tabbtn" type="button" role="tab" aria-selected="false" aria-controls="viewLog">規則與 Log 對應</button>
+  </div>
+
+  <!-- 分頁一：新舊規則比對 -->
+  <div id="viewDiff" class="view" role="tabpanel" aria-labelledby="tabDiff">
+    <ol class="steps">
+      <li><b>1</b>貼上舊版與新版</li>
+      <li><b>2</b>按下「比對」</li>
+      <li><b>3</b>查看差異</li>
+    </ol>
+
+    <section class="panel format" aria-labelledby="fmtTitle">
+      <h2 id="fmtTitle">規則寫法</h2>
+      <p class="syntax"><span>動作</span><span>協定</span><span>來源</span><i>-&gt;</i><span>目的</span><span>埠號</span></p>
+      <ul class="help">
+        <li>動作：<b>允許</b> 或 <b>拒絕</b>。協定：TCP、UDP、ICMP 或「任意」。</li>
+        <li>來源與目的：IPv4 位址（如 10.0.0.5）、網段（如 10.0.0.0/24）或「任意」。</li>
+        <li>埠號：單一埠（443）、範圍（8080-8090）或「任意」。ICMP 的埠號請寫「任意」。</li>
+        <li>一行一條。<code>#</code> 開頭的行是註解，空白行會略過。</li>
+      </ul>
+      <p class="example">範例：<code>允許 TCP 10.0.0.0/24 -&gt; 任意 443</code></p>
+    </section>
+
+    <section class="inputs" aria-label="規則輸入">
+      <div class="panel box-old">
+        <label for="oldRules"><span class="chip chip-old">舊版</span>舊版規則</label>
+        <textarea id="oldRules" rows="10" spellcheck="false" placeholder="貼上舊版規則，一行一條"></textarea>
+      </div>
+      <div class="panel box-new">
+        <label for="newRules"><span class="chip chip-new">新版</span>新版規則</label>
+        <textarea id="newRules" rows="10" spellcheck="false" placeholder="貼上新版規則，一行一條"></textarea>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="compareBtn" class="primary" type="button">比對</button>
+      <button id="sampleBtn" class="ghost" type="button">載入示範資料</button>
+      <button id="clearBtn" class="ghost" type="button">清空</button>
+    </div>
+
+    <section id="result" aria-live="polite"></section>
+  </div>
+
+  <!-- 分頁二：規則與 log 對應 -->
+  <div id="viewLog" class="view" role="tabpanel" aria-labelledby="tabLog" hidden>
+    <ol class="steps">
+      <li><b>1</b>貼上規則</li>
+      <li><b>2</b>貼上 Log</li>
+      <li><b>3</b>按下「對應」</li>
+    </ol>
+
+    <section class="panel format" aria-labelledby="logFmtTitle">
+      <h2 id="logFmtTitle">Log 寫法</h2>
+      <p class="syntax"><span>日期</span><span>時間</span><span>協定</span><span>來源</span><i>-&gt;</i><span>目的</span><span>埠號</span><span>動作（可省略）</span></p>
+      <ul class="help">
+        <li>來源與目的必須是單一 IPv4 位址，埠號是單一數字。ICMP 的埠號寫「任意」。</li>
+        <li>一行一筆。<code>#</code> 開頭的行是註解，空白行會略過。</li>
+        <li>也可以按「匯入 Log 檔」，或把檔案拖進 Log 輸入框。支援 .txt、.log、.csv（2 MB 以內）。CSV 的欄位順序同上，可以沒有「->」欄，第一列若是標題會自動略過。</li>
+        <li>對應方式：由上往下，第一條符合協定、來源、目的、埠號的規則，就是這筆 log 命中的規則。</li>
+      </ul>
+      <p class="example">範例：<code>2026-10-08 09:15:02 TCP 203.0.113.7 -&gt; 192.168.1.10 443 允許</code></p>
+    </section>
+
+    <section class="inputs" aria-label="規則與 log 輸入">
+      <div class="panel box-new">
+        <label for="mapRules"><span class="chip chip-new">規則</span>防火牆規則（順序有意義）</label>
+        <textarea id="mapRules" rows="10" spellcheck="false" placeholder="貼上規則，一行一條，由上到下比對"></textarea>
+      </div>
+      <div class="panel box-old">
+        <label for="mapLogs"><span class="chip chip-old">Log</span>連線紀錄</label>
+        <textarea id="mapLogs" rows="10" spellcheck="false" placeholder="貼上 log，一行一筆"></textarea>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="mapBtn" class="primary" type="button">對應</button>
+      <button id="mapSampleBtn" class="ghost" type="button">載入示範資料</button>
+      <button id="importBtn" class="ghost" type="button">匯入 Log 檔</button>
+      <input id="logFile" type="file" accept=".txt,.log,.csv,text/plain,text/csv" hidden>
+      <button id="useNewBtn" class="ghost" type="button">帶入「規則比對」頁的新版規則</button>
+      <button id="mapClearBtn" class="ghost" type="button">清空</button>
+    </div>
+    <p id="importMsg" class="say" role="status" hidden></p>
+
+    <section id="mapResult" aria-live="polite"></section>
+  </div>
+
+  <footer>
+    <p>示範資料中的位址都是虛構的（內部網段與文件保留網段）。本工具只依你貼上的規則做比對，沒有模擬預設政策，也不能取代正式的變更審查或資安事件分析。僅供課堂與自學練習。</p>
+  </footer>
+</main>
+<script src="script.js"></script>
+</body>
+</html>
