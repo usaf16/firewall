@@ -1,7 +1,11 @@
 (function () {
   'use strict';
 
-  var ANY = '任意';
+  var C = self.FWCore;
+  var ANY = C.ANY;
+  var disp = C.disp, ruleText = C.ruleText, plain = C.plain, analyze = C.analyze, warnText = C.warnText;
+  var parseRules = C.parseRules, parseLogs = C.parseLogs, buildDiff = C.buildDiff;
+
   var $ = function (id) { return document.getElementById(id); };
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -11,294 +15,15 @@
   }
 
   /* =========================================================
-     一、關鍵字對照（英文與設備別名）
+     一、畫面小元件
      ========================================================= */
-  var ACTIONS = {
-    '允許': '允許', 'ALLOW': '允許', 'PERMIT': '允許', 'ACCEPT': '允許', 'PASS': '允許',
-    '拒絕': '拒絕', 'DENY': '拒絕', 'DROP': '拒絕', 'BLOCK': '拒絕', 'REJECT': '拒絕'
-  };
-  var SERVICES = { HTTP: 80, HTTPS: 443, SSH: 22, DNS: 53, FTP: 21, TELNET: 23, SMTP: 25, NTP: 123, SMB: 445, RDP: 3389, MYSQL: 3306 };
-  var PROTOS = ['TCP', 'UDP', 'ICMP'];
-
-  function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k); }
-  function isAny(t) { var u = t.toUpperCase(); return t === ANY || u === 'ANY' || u === 'ALL' || t === '*'; }
-  function actionOf(t) { var u = t.toUpperCase(); return has(ACTIONS, u) ? ACTIONS[u] : ''; }
-  function arrowProblem(t) {
-    if (t === '->' || t === '→') { return ''; }
-    if (/^[-=]*>+$|^→+$/.test(t)) { return '箭頭請寫成 ->，目前是「' + t + '」。'; }
-    return '來源與目的之間要用「->」連接，目前是「' + t + '」。';
-  }
-
-  /* =========================================================
-     二、位址、埠號、規則解析
-     ========================================================= */
-  function ipToInt(s) {
-    var q = s.split('.');
-    return (((Number(q[0]) * 256 + Number(q[1])) * 256 + Number(q[2])) * 256 + Number(q[3])) >>> 0;
-  }
-  function intToIp(n) { return [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'); }
-  function maskOf(m) { return m === 0 ? 0 : (0xFFFFFFFF << (32 - m)) >>> 0; }
-
-  function parseIp(t) {
-    if (isAny(t)) { return { ok: true, norm: ANY }; }
-    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d+))?$/.exec(t);
-    if (!m) { return { ok: false, msg: '位址格式不對：「' + t + '」。請寫成 10.0.0.5、10.0.0.0/24 或「任意」。' }; }
-    for (var i = 1; i <= 4; i++) {
-      if (Number(m[i]) > 255) { return { ok: false, msg: 'IP 位址每一段必須是 0 到 255：「' + t + '」。' }; }
-    }
-    var mask = m[5] === undefined ? 32 : Number(m[5]);
-    if (mask > 32) { return { ok: false, msg: '不合法的 CIDR 遮罩格式 (' + t + ')，遮罩必須是 0 到 32。' }; }
-    if (mask === 0) { return { ok: true, norm: ANY }; }
-    var addr = m[1] + '.' + m[2] + '.' + m[3] + '.' + m[4];
-    return { ok: true, norm: intToIp((ipToInt(addr) & maskOf(mask)) >>> 0) + '/' + mask };
-  }
-
-  // 埠號：單一埠、範圍、服務名稱，或用逗號連接的多個（80,443,8080-8090）。重疊或相鄰的範圍會合併。
-  function parsePort(t) {
-    if (isAny(t)) { return { ok: true, norm: ANY }; }
-    var parts = t.split(','), ranges = [];
-    for (var i = 0; i < parts.length; i++) {
-      var p = parts[i];
-      if (p === '') { return { ok: false, msg: '埠號清單裡有空的項目：「' + t + '」，多個埠號請用逗號連接且不加空白（例如 80,443）。' }; }
-      if (isAny(p)) { return { ok: true, norm: ANY }; }
-      var u = p.toUpperCase();
-      if (has(SERVICES, u)) { ranges.push([SERVICES[u], SERVICES[u]]); continue; }
-      var m = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(p);
-      if (!m) { return { ok: false, msg: '埠號格式不對：「' + p + '」。請寫成 443、8080-8090、80,443、服務名稱（如 HTTPS）或「任意」。' }; }
-      var a = Number(m[1]), b = m[2] === undefined ? a : Number(m[2]);
-      if (a < 1 || a > 65535 || b < 1 || b > 65535) { return { ok: false, msg: '埠號必須在 1 到 65535 之間：「' + p + '」。' }; }
-      if (a > b) { return { ok: false, msg: '埠號範圍的起點不能大於終點：「' + p + '」。' }; }
-      ranges.push([a, b]);
-    }
-    ranges.sort(function (x, y) { return x[0] - y[0]; });
-    var merged = [];
-    ranges.forEach(function (r) {
-      var last = merged[merged.length - 1];
-      if (last && r[0] <= last[1] + 1) { last[1] = Math.max(last[1], r[1]); } else { merged.push([r[0], r[1]]); }
-    });
-    return { ok: true, norm: merged.map(function (r) { return r[0] === r[1] ? String(r[0]) : r[0] + '-' + r[1]; }).join(',') };
-  }
-
-  function parseRuleLine(line) {
-    var p = line.split(/\s+/);
-    if (p.length !== 6) {
-      return { error: '欄位數量不對，應該是「動作 協定 來源 -> 目的 埠號」共 6 個部分（目前 ' + p.length + ' 個）。多個埠號請用逗號連接且不加空白，例如 80,443。' };
-    }
-    var action = actionOf(p[0]);
-    if (!action) {
-      return { error: '動作必須是「允許」或「拒絕」（也可寫 allow、permit、deny、drop 等），目前是「' + p[0] + '」。' };
-    }
-    var proto = isAny(p[1]) ? ANY : p[1].toUpperCase();
-    if (proto !== ANY && PROTOS.indexOf(proto) < 0) {
-      return { error: '協定必須是 TCP、UDP、ICMP 或「任意」，目前是「' + p[1] + '」。' };
-    }
-    var src = parseIp(p[2]);
-    if (!src.ok) { return { error: '來源：' + src.msg }; }
-    var ap = arrowProblem(p[3]);
-    if (ap) { return { error: ap }; }
-    var dst = parseIp(p[4]);
-    if (!dst.ok) { return { error: '目的：' + dst.msg }; }
-    var port = parsePort(p[5]);
-    if (!port.ok) { return { error: port.msg }; }
-    if (proto === 'ICMP' && port.norm !== ANY) { return { error: 'ICMP 沒有埠號，埠號請寫「任意」。' }; }
-    return { rule: { action: action, proto: proto, src: src.norm, dst: dst.norm, port: port.norm, key: [proto, src.norm, dst.norm, port.norm].join('|') } };
-  }
-
-  // 規則順序有意義：保留全部有效規則，no = 第幾條有效規則，line = 原始行號
-  function parseRules(text) {
-    var rules = [], errors = [];
-    text.split(/\r?\n/).forEach(function (raw, i) {
-      var line = raw.trim();
-      if (!line || line.charAt(0) === '#') { return; }
-      var r = parseRuleLine(line);
-      if (r.error) { errors.push({ n: i + 1, text: line, msg: r.error }); return; }
-      r.rule.line = i + 1;
-      r.rule.no = rules.length + 1;
-      rules.push(r.rule);
-    });
-    return { rules: rules, errors: errors };
-  }
-
-  function parseLogLine(line) {
-    var p = line.split(/\s+/);
-    if (p.length !== 7 && p.length !== 8) {
-      return { error: '欄位數量不對，應該是「日期 時間 協定 來源 -> 目的 埠號 [動作]」（目前 ' + p.length + ' 個）。' };
-    }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(p[0])) { return { error: '日期格式不對：「' + p[0] + '」，請寫成 2026-10-08。' }; }
-    if (!/^\d{2}:\d{2}:\d{2}$/.test(p[1])) { return { error: '時間格式不對：「' + p[1] + '」，請寫成 09:15:02。' }; }
-    var proto = p[2].toUpperCase();
-    if (PROTOS.indexOf(proto) < 0) { return { error: 'log 的協定必須是 TCP、UDP 或 ICMP，目前是「' + p[2] + '」。' }; }
-    var src = parseIp(p[3]);
-    if (!src.ok) { return { error: '來源：' + src.msg }; }
-    if (src.norm === ANY || !/\/32$/.test(src.norm)) { return { error: '來源必須是單一 IPv4 位址，目前是「' + p[3] + '」。' }; }
-    var ap = arrowProblem(p[4]);
-    if (ap) { return { error: ap }; }
-    var dst = parseIp(p[5]);
-    if (!dst.ok) { return { error: '目的：' + dst.msg }; }
-    if (dst.norm === ANY || !/\/32$/.test(dst.norm)) { return { error: '目的必須是單一 IPv4 位址，目前是「' + p[5] + '」。' }; }
-    var port;
-    if (proto === 'ICMP') {
-      if (!isAny(p[6]) && p[6] !== '-') { return { error: 'ICMP 沒有埠號，埠號請寫「任意」。' }; }
-      port = ANY;
-    } else {
-      var pp = parsePort(p[6]);
-      if (!pp.ok || pp.norm === ANY || /[-,]/.test(pp.norm)) { return { error: 'log 的埠號必須是單一數字或服務名稱，目前是「' + p[6] + '」。' }; }
-      port = pp.norm;
-    }
-    var action = '';
-    if (p.length === 8) {
-      action = actionOf(p[7]);
-      if (!action) { return { error: '動作必須是「允許」或「拒絕」，目前是「' + p[7] + '」。' }; }
-    }
-    return { log: { date: p[0], time: p[1], proto: proto, src: src.norm.replace(/\/32$/, ''), dst: dst.norm.replace(/\/32$/, ''), port: port, action: action } };
-  }
-
-  function parseLogs(text) {
-    var logs = [], errors = [];
-    text.split(/\r?\n/).forEach(function (raw, i) {
-      var line = raw.trim();
-      if (!line || line.charAt(0) === '#') { return; }
-      var r = parseLogLine(line);
-      if (r.error) { errors.push({ n: i + 1, text: line, msg: r.error }); return; }
-      r.log.n = i + 1;
-      logs.push(r.log);
-    });
-    return { logs: logs, errors: errors };
-  }
-
-  /* =========================================================
-     三、比對、遮蔽與冗餘分析
-     ========================================================= */
-  function ipCover(a, b) {
-    if (a === ANY) { return true; }
-    if (b === ANY) { return false; }
-    var x = a.split('/'), y = b.split('/');
-    var am = Number(x[1]), bm = Number(y[1]);
-    return am <= bm && ((ipToInt(y[0]) & maskOf(am)) >>> 0) === ipToInt(x[0]);
-  }
-  function portRanges(s) {
-    return s.split(',').map(function (x) { var r = x.split('-'); return [Number(r[0]), Number(r[r.length - 1])]; });
-  }
-  // b 的每一段都要落在 a 的某一段裡面
-  function portCover(a, b) {
-    if (a === ANY) { return true; }
-    if (b === ANY) { return false; }
-    var ar = portRanges(a);
-    return portRanges(b).every(function (y) { return ar.some(function (x) { return x[0] <= y[0] && y[1] <= x[1]; }); });
-  }
-  function covers(a, b) {
-    return (a.proto === ANY || a.proto === b.proto) && ipCover(a.src, b.src) && ipCover(a.dst, b.dst) && portCover(a.port, b.port);
-  }
-
-  // 後面的規則若完全被前面某一條涵蓋：動作不同 = 遮蔽，動作相同 = 冗餘
-  function analyze(rules) {
-    var out = [];
-    for (var j = 1; j < rules.length; j++) {
-      for (var i = 0; i < j; i++) {
-        if (covers(rules[i], rules[j])) {
-          out.push({ kind: rules[i].action === rules[j].action ? 'redundant' : 'shadow', j: rules[j], i: rules[i] });
-          break;
-        }
-      }
-    }
-    return out;
-  }
-  function warnText(w) {
-    if (w.kind === 'shadow') {
-      return '第 ' + w.j.no + ' 條（第 ' + w.j.line + ' 行）已被第 ' + w.i.no + ' 條覆蓋，這條' + (w.j.action === '拒絕' ? '阻擋' : '放行') + '規則將永遠不會被觸發。';
-    }
-    return '第 ' + w.j.no + ' 條（第 ' + w.j.line + ' 行）與第 ' + w.i.no + ' 條動作相同且範圍已被涵蓋，建議合併或刪除。';
-  }
-
-  function ipMatch(spec, ip) {
-    if (spec === ANY) { return true; }
-    var parts = spec.split('/');
-    var m = maskOf(Number(parts[1]));
-    return ((ipToInt(parts[0]) & m) >>> 0) === ((ipToInt(ip) & m) >>> 0);
-  }
-  function portMatch(spec, port) {
-    if (spec === ANY) { return true; }
-    if (port === ANY) { return false; }
-    var v = Number(port);
-    return portRanges(spec).some(function (r) { return v >= r[0] && v <= r[1]; });
-  }
-  function ruleHits(rule, log) {
-    return (rule.proto === ANY || rule.proto === log.proto) && ipMatch(rule.src, log.src) && ipMatch(rule.dst, log.dst) && portMatch(rule.port, log.port);
-  }
-
-  // 最長遞增子序列，回傳「保持原相對順序」的位置集合
-  function lisSet(arr) {
-    var tails = [], tailIdx = [], prev = [];
-    for (var k = 0; k < arr.length; k++) {
-      var lo = 0, hi = tails.length;
-      while (lo < hi) {
-        var mid = (lo + hi) >> 1;
-        if (tails[mid] < arr[k]) { lo = mid + 1; } else { hi = mid; }
-      }
-      tails[lo] = arr[k];
-      tailIdx[lo] = k;
-      prev[k] = lo > 0 ? tailIdx[lo - 1] : -1;
-    }
-    var set = {}, cur = tails.length ? tailIdx[tails.length - 1] : -1;
-    while (cur >= 0) { set[cur] = true; cur = prev[cur]; }
-    return set;
-  }
-
-  function buildDiff(oldRules, newRules) {
-    var oldMap = {}, newMap = {}, oldFirst = [], newFirst = [], dups = { old: [], neu: [] };
-    oldRules.forEach(function (r) { if (oldMap[r.key]) { dups.old.push(r); } else { oldMap[r.key] = r; oldFirst.push(r); } });
-    newRules.forEach(function (r) { if (newMap[r.key]) { dups.neu.push(r); } else { newMap[r.key] = r; newFirst.push(r); } });
-
-    var identNew = [], newIdx = {};
-    newFirst.forEach(function (n) { var o = oldMap[n.key]; if (o && o.action === n.action) { newIdx[n.key] = identNew.length; identNew.push(n); } });
-    var oldIdent = oldFirst.filter(function (o) { return newMap[o.key] && newMap[o.key].action === o.action; });
-    var stable = lisSet(oldIdent.map(function (o) { return newIdx[o.key]; }));
-    var movedKeys = {};
-    oldIdent.forEach(function (o, i) { if (!stable[i]) { movedKeys[o.key] = true; } });
-
-    var removed = oldFirst.filter(function (o) { return !newMap[o.key]; });
-    var ri = 0, entries = [];
-    newFirst.forEach(function (n) {
-      var o = oldMap[n.key];
-      if (o) { while (ri < removed.length && removed[ri].no < o.no) { entries.push({ type: 'del', before: removed[ri++] }); } }
-      if (!o) { entries.push({ type: 'add', after: n }); }
-      else if (o.action !== n.action) { entries.push({ type: 'mod', before: o, after: n }); }
-      else { entries.push({ type: movedKeys[n.key] ? 'moved' : 'same', before: o, after: n }); }
-    });
-    while (ri < removed.length) { entries.push({ type: 'del', before: removed[ri++] }); }
-
-    var counts = { add: 0, del: 0, mod: 0, moved: 0, same: 0 };
-    entries.forEach(function (e) { counts[e.type]++; });
-    return { entries: entries, counts: counts, dups: dups };
-  }
-
-  /* =========================================================
-     四、畫面小元件
-     ========================================================= */
-  function disp(s) { return s.replace(/\/32$/, ''); }
-  function ruleText(r) { return r.action + ' ' + r.proto + ' ' + disp(r.src) + ' -> ' + disp(r.dst) + ' ' + r.port; }
-  function plain(r) {
-    var where = function (v) { return v === ANY ? '任意位置' : disp(v); };
-    var portText = r.proto === 'ICMP' ? '' : (r.port === ANY ? '，任意埠號' : '，埠號 ' + r.port);
-    return r.action + '：' + (r.proto === ANY ? '任何協定' : r.proto) + ' 從 ' + where(r.src) + ' 連到 ' + where(r.dst) + portText;
-  }
-
-  // 網段實體範圍（給滑鼠懸停提示用）
-  function cidrInfo(norm) {
-    var parts = norm.split('/'), mask = Number(parts[1]);
-    var net = (ipToInt(parts[0]) & maskOf(mask)) >>> 0;
-    var size = Math.pow(2, 32 - mask);
-    var last = (net + size - 1) >>> 0;
-    if (mask === 32) { return '單一主機 ' + parts[0]; }
-    if (mask === 31) { return intToIp(net) + ' – ' + intToIp(last) + '（2 個位址，點對點連線）'; }
-    return intToIp(net) + ' – ' + intToIp(last) + '（共 ' + size.toLocaleString('en-US') + ' 個位址，可用主機 ' + intToIp(net + 1) + ' – ' + intToIp(last - 1) + '）';
-  }
+  function hostPort(addr, port) { return addr.indexOf(':') >= 0 ? '[' + disp(addr) + ']:' + port : addr + ':' + port; }
 
   function addrSpan(v) {
-    if (v === ANY) { var a = el('span', 'any', ANY); a.title = '任意位址（所有 IPv4）'; return a; }
+    if (v === ANY) { var a = el('span', 'any', ANY); a.title = '任意位址（所有 IPv4 與 IPv6）'; return a; }
     var s = el('span', 'ip', disp(v));
-    s.title = cidrInfo(v);
-    if (/\/(?!32$)/.test(v)) { s.className = 'ip cidr'; }
+    s.title = C.cidrInfo(v);
+    if (!/\/(32|128)$/.test(v)) { s.className = 'ip cidr'; }
     return s;
   }
 
@@ -318,12 +43,13 @@
     var sec = el('section', 'panel errors');
     sec.appendChild(el('h2', '', title + '（' + list.length + '）'));
     var ul = el('ul', 'plain');
-    list.forEach(function (e) {
+    list.slice(0, 200).forEach(function (e) {
       var li = el('li');
       li.appendChild(el('div', 'rule', '第 ' + e.n + ' 行：' + e.text));
       li.appendChild(el('p', 'say', showMsg ? e.msg : '與前面的規則比對條件相同，已略過這一行。'));
       ul.appendChild(li);
     });
+    if (list.length > 200) { ul.appendChild(el('li', 'say', '還有 ' + (list.length - 200) + ' 筆未列出。')); }
     sec.appendChild(ul);
     return sec;
   }
@@ -332,7 +58,7 @@
     var sec = el('section', 'panel warnpanel');
     sec.appendChild(el('h2', '', title + '（' + warns.length + '）'));
     var ul = el('ul', 'plain');
-    warns.forEach(function (w) {
+    warns.slice(0, 200).forEach(function (w) {
       var li = el('li');
       li.appendChild(el('span', 'tagw ' + (w.kind === 'shadow' ? 'shadow' : 'redundant'), w.kind === 'shadow' ? '遮蔽' : '冗餘'));
       li.appendChild(document.createTextNode(' ' + warnText(w)));
@@ -350,7 +76,7 @@
   }
 
   /* =========================================================
-     五、CSV 匯出
+     二、CSV 匯出
      ========================================================= */
   function csvCell(v) {
     var s = String(v == null ? '' : v);
@@ -374,7 +100,7 @@
   }
 
   /* =========================================================
-     六、暫存（localStorage）與主題
+     三、暫存（localStorage）與主題
      ========================================================= */
   var STORE = 'fw-diff-v2', THEME_KEY = 'fw-theme';
   function loadSaved() {
@@ -386,7 +112,7 @@
         oldRules: $('oldRules').value, newRules: $('newRules').value,
         mapRules: $('mapRules').value, mapLogs: $('mapLogs').value, def: $('defPolicy').value
       }));
-    } catch (e) { /* 無痕模式或儲存空間已滿時略過 */ }
+    } catch (e) { /* 無痕模式或儲存空間已滿（大檔案）時略過 */ }
   }
   function applyTheme(t) {
     document.documentElement.setAttribute('data-fw-theme', t);
@@ -396,84 +122,118 @@
   }
 
   /* =========================================================
-     七、輸入框：行號、語法上色、錯誤行反白、即時檢查
+     四、輸入框：行號、語法上色、波浪底線、錯誤行反白、即時檢查
+        只繪製畫面上看得到的行（加上前後緩衝），行數再多也不會變慢
      ========================================================= */
   var ED = {};
+  var BUF = 25, LINT_MAX = 5000;
 
-  function tokenClass(kind, idx, tok) {
+  function tokenClass(kind, idx, tok, toks) {
     if (kind === 'rules') {
-      if (idx === 0) { var a = actionOf(tok); return a === '允許' ? 'tk-allow' : (a === '拒絕' ? 'tk-deny' : ''); }
-      if (idx === 1) { return isAny(tok) ? 'tk-any' : 'tk-proto'; }
-      if (idx === 2 || idx === 4) { return isAny(tok) ? 'tk-any' : 'tk-ip'; }
+      if (toks[0].charAt(0) === '$') { return idx === 0 ? 'tk-var' : (idx === 1 ? 'tk-arrow' : (idx === 2 ? 'tk-port' : '')); }
+      if (idx === 0) { var a = C.actionOf(tok); return a === '允許' ? 'tk-allow' : (a === '拒絕' ? 'tk-deny' : ''); }
+      if (idx === 1) { return C.isAny(tok) ? 'tk-any' : 'tk-proto'; }
+      if (idx === 2 || idx === 4) { return C.isAny(tok) ? 'tk-any' : 'tk-ip'; }
       if (idx === 3) { return 'tk-arrow'; }
-      if (idx === 5) { return isAny(tok) ? 'tk-any' : 'tk-port'; }
+      if (idx === 5) { return C.isAny(tok) ? 'tk-any' : (tok.indexOf('$') >= 0 ? 'tk-var' : 'tk-port'); }
       return '';
     }
     if (idx === 0 || idx === 1) { return 'tk-date'; }
     if (idx === 2) { return 'tk-proto'; }
     if (idx === 3 || idx === 5) { return 'tk-ip'; }
     if (idx === 4) { return 'tk-arrow'; }
-    if (idx === 6) { return isAny(tok) ? 'tk-any' : 'tk-port'; }
-    if (idx === 7) { var b = actionOf(tok); return b === '允許' ? 'tk-allow' : (b === '拒絕' ? 'tk-deny' : ''); }
+    if (idx === 6) { return C.isAny(tok) ? 'tk-any' : 'tk-port'; }
+    if (idx === 7) { var b = C.actionOf(tok); return b === '允許' ? 'tk-allow' : (b === '拒絕' ? 'tk-deny' : ''); }
     return '';
   }
 
-  // 疊在輸入框後面的上色層：文字與輸入框逐字對齊，所以只用顏色，不改粗細或斜體
-  function highlightInto(container, line, kind) {
-    if (line.trim().charAt(0) === '#') { container.appendChild(el('span', 'tk-cm', line)); return; }
+  // 上色層與輸入框逐字對齊，所以只用顏色與底線，不改粗細或斜體。格式錯誤的欄位畫紅色波浪底線。
+  function highlightInto(container, line, kind, vars) {
+    var trimmed = line.trim();
+    if (trimmed.charAt(0) === '#') { container.appendChild(el('span', 'tk-cm', line)); return; }
+    var toks = trimmed ? trimmed.split(/\s+/) : [];
     var idx = 0;
     line.split(/(\s+)/).forEach(function (p) {
       if (p === '') { return; }
       if (/^\s+$/.test(p)) { container.appendChild(document.createTextNode(p)); return; }
-      var cls = tokenClass(kind, idx++, p);
-      if (cls) { container.appendChild(el('span', cls, p)); } else { container.appendChild(document.createTextNode(p)); }
+      var cls = tokenClass(kind, idx, p, toks);
+      if (C.tokenBad(kind, idx, p, toks, vars)) { cls += ' tk-bad'; }
+      idx++;
+      if (cls.trim()) { container.appendChild(el('span', cls.trim(), p)); } else { container.appendChild(document.createTextNode(p)); }
     });
   }
 
   function makeEditor(id, kind) {
-    var ta = $(id), gut = $(id + 'Gut'), hl = $(id + 'Hl'), lint = $(id + 'Lint'), timer = 0, marked = null;
+    var ta = $(id), gut = $(id + 'Gut'), hl = $(id + 'Hl'), lint = $(id + 'Lint'), timer = 0;
+    var hlIn = el('div', 'hl-inner'), gutIn = el('div', 'gut-inner');
+    hl.appendChild(hlIn); gut.appendChild(gutIn);
+    var lines = [''], bad = {}, wn = {}, vars = {}, win = { a: 0, b: -1 }, marked = 0, lh = 24;
     var ed = { onchange: null };
+
+    function lineH() { var v = parseFloat(getComputedStyle(ta).lineHeight); if (v > 0) { lh = v; } return lh; }
+
+    function rebuild(a, b) {
+      hlIn.textContent = ''; gutIn.textContent = '';
+      var fh = document.createDocumentFragment(), fg = document.createDocumentFragment();
+      for (var i = a; i <= b; i++) {
+        var n = i + 1;
+        var cls = (bad[n] ? ' bad' : (wn[n] ? ' warn' : '')) + (n === marked ? ' xhl' : '');
+        var d = el('div', 'hl-line' + cls);
+        highlightInto(d, lines[i].replace(/\r$/, ''), kind, vars);
+        fh.appendChild(d);
+        fg.appendChild(el('div', 'ln' + cls, String(n)));
+      }
+      hlIn.appendChild(fh); gutIn.appendChild(fg);
+      win = { a: a, b: b };
+    }
+    function place() {
+      var top = (12 + win.a * lh - ta.scrollTop) + 'px';
+      hlIn.style.top = top; gutIn.style.top = top;
+      hlIn.style.left = (-ta.scrollLeft) + 'px';
+      hlIn.style.width = ta.scrollWidth + 'px';
+    }
+    function sync(force) {
+      lineH();
+      var L = lines.length;
+      var first = Math.max(0, Math.floor((ta.scrollTop - 12) / lh));
+      var last = Math.min(L - 1, Math.ceil((ta.scrollTop + ta.clientHeight) / lh));
+      if (force || win.b < win.a || first < win.a || last > win.b) { rebuild(Math.max(0, first - BUF), Math.min(L - 1, last + BUF)); }
+      place();
+    }
+    // 上色層與行號欄只貼在輸入框「看得到文字」的範圍內，不要蓋到捲軸底下
+    function fit() {
+      var sbW = ta.offsetWidth - ta.clientWidth, sbH = ta.offsetHeight - ta.clientHeight;
+      hl.style.right = sbW + 'px'; hl.style.bottom = sbH + 'px';
+      gut.style.bottom = sbH + 'px';
+    }
 
     function refresh() {
       var text = ta.value;
-      var lines = text.split('\n'), L = lines.length;
-      var errs = [], warns = [], count = 0;
-      if (kind === 'rules') {
-        var pr = parseRules(text);
-        errs = pr.errors; count = pr.rules.length;
-        warns = analyze(pr.rules);
-      } else {
-        var pl = parseLogs(text);
-        errs = pl.errors; count = pl.logs.length;
-      }
-      var bad = {}, wn = {};
-      errs.forEach(function (e) { bad[e.n] = true; });
-      warns.forEach(function (w) { wn[w.j.line] = true; });
-
-      gut.textContent = ''; hl.textContent = ''; marked = null;
-      if (L <= 3000) {
-        var fg = document.createDocumentFragment(), fh = document.createDocumentFragment();
-        for (var i = 1; i <= L; i++) {
-          var cls = bad[i] ? ' bad' : (wn[i] ? ' warn' : '');
-          fg.appendChild(el('div', 'ln' + cls, String(i)));
-          var d = el('div', 'hl-line' + cls);
-          highlightInto(d, lines[i - 1].replace(/\r$/, ''), kind);
-          fh.appendChild(d);
+      lines = text.split('\n');
+      var L = lines.length;
+      vars = kind === 'rules' ? C.scanVars(lines) : {};
+      bad = {}; wn = {};
+      var errs = [], warns = [], count = 0, skipped = L > LINT_MAX;
+      if (!skipped) {
+        if (kind === 'rules') {
+          var pr = parseRules(text);
+          errs = pr.errors; count = pr.rules.length; warns = analyze(pr.rules);
+        } else {
+          var pl = parseLogs(text);
+          errs = pl.errors; count = pl.logs.length;
         }
-        gut.appendChild(fg); hl.appendChild(fh);
-        ta.classList.add('hlmode');
-      } else {
-        // 行數太多時不上色，改回輸入框自己的文字顏色
-        var nums = []; for (var k = 1; k <= L; k++) { nums.push(k); }
-        gut.style.whiteSpace = 'pre';
-        gut.textContent = nums.join('\n');
-        ta.classList.remove('hlmode');
+        errs.forEach(function (e) { bad[e.n] = true; });
+        warns.forEach(function (w) { wn[w.j.line] = true; });
       }
-      gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft;
-      fit();
+      ta.classList.add('hlmode');
+      sync(true); fit();
 
       lint.textContent = '';
       if (!text.trim()) { lint.appendChild(el('p', 'lint-hint', '尚未輸入內容。')); return; }
+      if (skipped) {
+        lint.appendChild(el('p', 'lint-hint', '共 ' + L.toLocaleString('en-US') + ' 行，已略過逐行即時檢查（語法上色與波浪底線仍會顯示）。按「' + (kind === 'rules' ? '比對' : '對應') + '」會完整解析並回報錯誤。'));
+        return;
+      }
       if (!errs.length && !warns.length) {
         lint.appendChild(el('p', 'lint-ok', '✓ 語法檢查通過，共 ' + count + (kind === 'rules' ? ' 條規則。' : ' 筆 log。')));
         return;
@@ -486,41 +246,43 @@
       lint.appendChild(ul);
     }
 
-    // 上色層與行號欄只貼在輸入框「看得到文字」的範圍內，不要蓋到捲軸底下
-    function fit() {
-      var sbW = ta.offsetWidth - ta.clientWidth, sbH = ta.offsetHeight - ta.clientHeight;
-      hl.style.right = sbW + 'px'; hl.style.bottom = sbH + 'px';
-      gut.style.bottom = sbH + 'px';
+    function reveal(line) {
+      lineH();
+      var top = 12 + (line - 1) * lh;
+      if (top < ta.scrollTop || top + lh > ta.scrollTop + ta.clientHeight) { ta.scrollTop = Math.max(0, top - ta.clientHeight / 3); }
     }
-    if (window.ResizeObserver) { new ResizeObserver(fit).observe(ta); }
-
     // 讓指定行發亮（跨區連動），必要時捲動到可見範圍
     function mark(line) {
-      if (marked) { marked.hl.classList.remove('xhl'); marked.ln.classList.remove('xhl'); marked = null; }
-      if (!line) { return; }
-      var h = hl.children[line - 1], g = gut.children[line - 1];
-      if (!h || !g) { return; }
-      h.classList.add('xhl'); g.classList.add('xhl');
-      marked = { hl: h, ln: g };
-      var lh = parseFloat(getComputedStyle(ta).lineHeight) || 24;
-      var top = 12 + (line - 1) * lh;
-      if (top < ta.scrollTop || top + lh > ta.scrollTop + ta.clientHeight) {
-        ta.scrollTop = Math.max(0, top - ta.clientHeight / 3);
-      }
+      marked = line || 0;
+      sync(true);
+      if (marked) { reveal(marked); }
+    }
+    // 點擊跳轉：把游標放到那一行並選取整行，方便直接修改
+    function focusLine(line) {
+      if (!line || line > lines.length) { return; }
+      var start = 0;
+      for (var i = 0; i < line - 1; i++) { start += lines[i].length + 1; }
+      var end = start + lines[line - 1].length;
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(start, end);
+      reveal(line);
+      var box = ta.closest('.editor');
+      if (box && box.scrollIntoView) { box.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
     }
 
     ta.addEventListener('input', function () {
       clearTimeout(timer);
       timer = setTimeout(function () { refresh(); save(); if (ed.onchange) { ed.onchange(); } }, 150);
     });
-    ta.addEventListener('scroll', function () { gut.scrollTop = ta.scrollTop; hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; });
-    ed.refresh = refresh; ed.mark = mark;
+    ta.addEventListener('scroll', function () { sync(false); });
+    if (window.ResizeObserver) { new ResizeObserver(function () { fit(); sync(false); }).observe(ta); }
+    ed.refresh = refresh; ed.mark = mark; ed.focusLine = focusLine;
     ED[id] = ed;
   }
   function setVal(id, text) { $(id).value = text; ED[id].refresh(); save(); }
 
   /* =========================================================
-     八、示範資料
+     五、示範資料
      ========================================================= */
   var SAMPLE_A = [
     '# 範例 A：舊版規則（虛構示範）',
@@ -533,18 +295,22 @@
   ].join('\n');
 
   var SAMPLE_B = [
-    '# 範例 B：新版規則（虛構示範，混用英文寫法、服務名稱與多埠號）',
+    '# 範例 B：新版規則（虛構示範，混用英文寫法、服務名稱、多埠號與 IPv6）',
     'allow tcp any -> 192.168.1.10 https',
     'deny tcp any -> any telnet',
     'deny tcp 10.0.0.0/24 -> 192.168.1.20 ssh',
     'allow udp 10.0.0.0/24 -> 192.168.1.53 dns',
     'permit icmp any -> any any',
     'allow tcp 10.0.1.0/24 -> 192.168.1.30 80,443,8080-8090',
-    'deny tcp 10.0.1.0/24 -> 192.168.1.30 8085'
+    'deny tcp 10.0.1.0/24 -> 192.168.1.30 8085',
+    'allow tcp 2001:db8:10::/48 -> 2001:db8:20::10 https'
   ].join('\n');
 
   var SAMPLE_RULES = [
     '# 規則由上到下比對，先命中者生效（虛構示範）',
+    '# 服務物件群組：先定義變數，再在埠號欄使用',
+    '$WEB = 80,443,8080-8090',
+    '',
     '允許 TCP 10.0.0.0/16 -> 任意 443',
     '允許 TCP 任意 -> 192.168.1.10 https',
     '拒絕 TCP 10.0.1.0/24 -> 任意 443',
@@ -554,11 +320,12 @@
     'deny tcp any -> any 23',
     'allow tcp 10.0.1.0/24 -> 192.168.1.30 8080-8090',
     '允許 TCP 10.0.0.0/24 -> 任意 443',
-    'allow tcp 10.0.2.0/24 -> 192.168.1.30 80,443,8080-8090'
+    'allow tcp 10.0.2.0/24 -> 192.168.1.30 $WEB',
+    'allow tcp 2001:db8:10::/48 -> 2001:db8:20::10 $WEB'
   ].join('\n');
 
   var SAMPLE_LOGS = [
-    '# 連線紀錄（虛構示範，203.0.113.x 與 198.51.100.x 為文件保留網段）',
+    '# 連線紀錄（虛構示範，203.0.113.x、198.51.100.x 與 2001:db8:: 為文件保留位址）',
     '2026-10-08 09:15:02 TCP 10.0.1.7 -> 192.168.1.10 443 允許',
     '2026-10-08 09:15:20 TCP 203.0.113.7 -> 192.168.1.10 443 允許',
     '2026-10-08 09:15:40 TCP 10.0.0.8 -> 192.168.1.20 22 拒絕',
@@ -569,11 +336,12 @@
     '2026-10-08 09:21:12 TCP 203.0.113.50 -> 192.168.1.10 80 拒絕',
     '2026-10-08 09:22:40 UDP 198.51.100.77 -> 192.168.1.53 53 允許',
     '2026-10-08 09:23:05 TCP 10.0.1.7 -> 192.168.1.10 443 允許',
-    '2026-10-08 09:24:10 TCP 10.0.2.8 -> 192.168.1.30 80 允許'
+    '2026-10-08 09:24:10 TCP 10.0.2.8 -> 192.168.1.30 80 允許',
+    '2026-10-08 09:25:00 TCP 2001:db8:10::5 -> 2001:db8:20::10 443 允許'
   ].join('\n');
 
   /* =========================================================
-     九、分頁一：規則比對
+     六、分頁一：規則比對
      ========================================================= */
   var DS = { entries: null, view: 'side', showSame: false };
 
@@ -644,6 +412,8 @@
       host.appendChild(sec);
       return;
     }
+    var CAP = 500;
+    if (rows.length > CAP) { sec.appendChild(el('p', 'say', '項目很多，畫面只顯示前 ' + CAP + ' 筆；上方統計與匯出的 CSV 包含全部。')); }
     if (DS.view === 'side') {
       var head = el('div', 'dhead');
       head.appendChild(el('span', '', ''));
@@ -652,7 +422,7 @@
       sec.appendChild(head);
     }
     var ul = el('ul', 'dlist');
-    rows.forEach(function (e) {
+    rows.slice(0, CAP).forEach(function (e) {
       var li = el('li', 'de de-' + e.type + (DS.view === 'uni' ? ' u' : ''));
       var sign = el('span', 'sign s-' + e.type, SIGN[e.type]);
       sign.setAttribute('title', TYPE_NAME[e.type]);
@@ -701,39 +471,77 @@
   }
 
   /* =========================================================
-     十、分頁二：規則與 Log 對應
+     七、分頁二：規則與 Log 對應（大量資料用背景執行緒計算、虛擬捲動顯示）
      ========================================================= */
-  var MS = { rows: null, filter: 'all', rp: null, def: '拒絕' };
+  var MS = { rows: null, filter: 'all', def: '拒絕', job: 0 };
+  var PIN = 0;                       // 被「點擊鎖定」的規則行號
+  var BIG_CHARS = 150000;            // log 文字超過這個長度就改用背景執行緒
+  var ROW_H = 40;
 
   function defaultAction() { return $('defPolicy').value === 'allow' ? '允許' : '拒絕'; }
 
+  var W = { w: null, bad: false, id: 0, cb: null };
+  function getWorker() {
+    if (W.bad) { return null; }
+    if (W.w) { return W.w; }
+    try {
+      W.w = new Worker('worker.js');
+      W.w.onmessage = function (e) {
+        var d = e.data;
+        if (!W.cb || d.id !== W.id) { return; }
+        var cb = W.cb; W.cb = null;
+        cb(d.ok ? d.result : null);
+      };
+      // 例如直接用 file:// 開啟時瀏覽器不允許 Worker，這時退回主執行緒計算
+      W.w.onerror = function () { W.bad = true; W.w = null; var cb = W.cb; W.cb = null; if (cb) { cb(null); } };
+    } catch (e) { W.bad = true; W.w = null; }
+    return W.w;
+  }
+  function computeMapAsync(rulesText, logsText, def, cb) {
+    var w = logsText.length > BIG_CHARS ? getWorker() : null;
+    if (!w) { cb(C.computeMap(rulesText, logsText, def)); return; }
+    W.id++;
+    W.cb = function (res) { if (res) { cb(res); } else { setTimeout(function () { cb(C.computeMap(rulesText, logsText, def)); }, 0); } };
+    w.postMessage({ id: W.id, rulesText: rulesText, logsText: logsText, def: def });
+  }
+
   function renderMap() {
     var box = $('mapResult');
+    var job = ++MS.job;
+    PIN = 0;
+    ED.mapRules.mark(0);
+    var rulesText = $('mapRules').value, logsText = $('mapLogs').value, def = defaultAction();
+    if (logsText.length > BIG_CHARS) {
+      box.textContent = '';
+      box.setAttribute('aria-busy', 'true');
+      box.appendChild(el('p', 'panel loading', '正在處理約 ' + Math.round(logsText.length / 1024).toLocaleString('en-US') + ' KB 的 log…（在背景計算，畫面不會卡住）'));
+    }
+    computeMapAsync(rulesText, logsText, def, function (res) {
+      if (job !== MS.job) { return; }
+      box.removeAttribute('aria-busy');
+      finishMap(res, def);
+    });
+  }
+
+  function finishMap(res, def) {
+    var box = $('mapResult');
     box.textContent = '';
-    ED.mapRules.mark(null);
-    var rp = parseRules($('mapRules').value);
-    var lp = parseLogs($('mapLogs').value);
-    if (!rp.rules.length && !lp.logs.length && !rp.errors.length && !lp.errors.length) {
+    var rp = res.rp, rows = res.rows, logErrors = res.logErrors;
+    if (!rp.rules.length && !rows.length && !rp.errors.length && !logErrors.length) {
       MS.rows = null;
       box.appendChild(el('p', 'panel empty', '規則和 log 都是空的。請貼上內容，或按「填入範例規則」與「填入測試 Log」。'));
       return;
     }
-    var def = defaultAction();
-    var rows = lp.logs.map(function (lg) {
-      var found = null;
-      for (var i = 0; i < rp.rules.length; i++) { if (ruleHits(rp.rules[i], lg)) { found = rp.rules[i]; break; } }
-      var final = found ? found.action : def;
-      return { log: lg, rule: found, final: final, mismatch: !!(lg.action && lg.action !== final) };
-    });
-    MS.rows = rows; MS.rp = rp; MS.def = def;
+    rows.forEach(function (r) { r.rule = r.no ? rp.rules[r.no - 1] : null; });
+    MS.rows = rows; MS.def = def;
 
-    var total = rows.length;
-    var allow = rows.filter(function (r) { return r.final === '允許'; }).length;
+    var total = rows.length, allow = 0, unmatched = 0, mismatch = 0, hitCount = {};
+    rows.forEach(function (r) {
+      if (r.final === '允許') { allow++; }
+      if (!r.rule) { unmatched++; } else { hitCount[r.no] = (hitCount[r.no] || 0) + 1; }
+      if (r.mismatch) { mismatch++; }
+    });
     var deny = total - allow;
-    var unmatched = rows.filter(function (r) { return !r.rule; }).length;
-    var mismatch = rows.filter(function (r) { return r.mismatch; }).length;
-    var hitCount = {};
-    rows.forEach(function (r) { if (r.rule) { hitCount[r.rule.no] = (hitCount[r.rule.no] || 0) + 1; } });
     var top = Object.keys(hitCount).map(function (k) { return { no: Number(k), n: hitCount[k] }; })
       .sort(function (a, b) { return b.n - a.n || a.no - b.no; }).slice(0, 3);
 
@@ -741,7 +549,7 @@
     var dash = el('section', 'panel dash');
     dash.appendChild(el('h2', '', '結果摘要'));
     var stats = el('div', 'stats');
-    var stat = function (num, label, cls) { var s = el('div', 'stat' + (cls ? ' ' + cls : '')); s.appendChild(el('b', '', String(num))); s.appendChild(el('span', '', label)); return s; };
+    var stat = function (num, label, cls) { var s = el('div', 'stat' + (cls ? ' ' + cls : '')); s.appendChild(el('b', '', num.toLocaleString('en-US'))); s.appendChild(el('span', '', label)); return s; };
     stats.appendChild(stat(total, '總解析筆數'));
     stats.appendChild(stat(unmatched, '未命中任何規則（套用' + (def === '允許' ? '預設允許' : '預設拒絕') + '）', unmatched ? 'bad' : ''));
     stats.appendChild(stat(mismatch, '與 log 記錄動作不一致', mismatch ? 'bad' : ''));
@@ -757,8 +565,8 @@
       ratio.appendChild(ra); ratio.appendChild(rd);
       dash.appendChild(ratio);
       var rt = el('div', 'ratiotxt');
-      rt.appendChild(el('span', 'good', '允許 ' + ap + '%（' + allow + ' 筆）'));
-      rt.appendChild(el('span', 'badtxt', '拒絕 ' + dp + '%（' + deny + ' 筆）'));
+      rt.appendChild(el('span', 'good', '允許 ' + ap + '%（' + allow.toLocaleString('en-US') + ' 筆）'));
+      rt.appendChild(el('span', 'badtxt', '拒絕 ' + dp + '%（' + deny.toLocaleString('en-US') + ' 筆）'));
       dash.appendChild(rt);
     }
     dash.appendChild(el('h3', '', '最常被命中的規則（前 3 名）'));
@@ -769,12 +577,12 @@
         li.tabIndex = 0;
         li.appendChild(el('span', 'n', (idx + 1) + '.'));
         li.appendChild(ruleNode(rp.rules[t.no - 1], '#' + t.no));
-        li.appendChild(el('span', 'hits', t.n + ' 筆'));
+        li.appendChild(el('span', 'hits', t.n.toLocaleString('en-US') + ' 筆'));
         var ln = rp.rules[t.no - 1].line;
         li.addEventListener('mouseenter', function () { ED.mapRules.mark(ln); });
         li.addEventListener('focus', function () { ED.mapRules.mark(ln); });
-        li.addEventListener('mouseleave', function () { ED.mapRules.mark(null); });
-        li.addEventListener('blur', function () { ED.mapRules.mark(null); });
+        li.addEventListener('mouseleave', function () { ED.mapRules.mark(PIN); });
+        li.addEventListener('blur', function () { ED.mapRules.mark(PIN); });
         tl.appendChild(li);
       });
       dash.appendChild(tl);
@@ -784,8 +592,8 @@
     box.appendChild(dash);
 
     if (rp.errors.length) { box.appendChild(problemPanel('規則格式有誤的行', rp.errors, true)); }
-    if (lp.errors.length) { box.appendChild(problemPanel('Log 格式有誤的行', lp.errors, true)); }
-    if (rp.errors.length || lp.errors.length) {
+    if (logErrors.length) { box.appendChild(problemPanel('Log 格式有誤的行', logErrors, true)); }
+    if (rp.errors.length || logErrors.length) {
       box.appendChild(el('p', 'say', '有格式錯誤的行沒有參與對應。注意：規則被略過會讓後面規則的編號往前移。'));
     }
     var warns = analyze(rp.rules);
@@ -818,51 +626,93 @@
     renderLogTable();
   }
 
+  // 點擊「跳轉」：左側規則清單選取那一行並鎖定亮起；再點一次取消鎖定
+  function jumpToRule(line) {
+    if (PIN === line) { PIN = 0; ED.mapRules.mark(0); return; }
+    PIN = line;
+    ED.mapRules.mark(line);
+    ED.mapRules.focusLine(line);
+  }
+
   function renderLogTable() {
     var host = $('logTable');
     if (!host || !MS.rows) { return; }
     host.textContent = '';
-    ED.mapRules.mark(null);
-    var rows = MS.rows.filter(function (r) {
+    var view = MS.rows.filter(function (r) {
       if (MS.filter === 'deny') { return r.final === '拒絕'; }
       if (MS.filter === 'issue') { return !r.rule || r.mismatch; }
       return true;
     });
-    var CAP = 1000;
     var sec = el('section', 'panel');
-    sec.appendChild(el('h2', '', 'Log 明細（顯示 ' + Math.min(rows.length, CAP) + ' / ' + rows.length + ' 筆' + (MS.filter === 'all' ? '' : '，已篩選') + '）'));
-    if (!rows.length) { sec.appendChild(el('p', 'empty', MS.rows.length ? '沒有符合篩選條件的 log。' : '沒有可顯示的 log。')); host.appendChild(sec); return; }
-    sec.appendChild(el('p', 'say', '把滑鼠移到某一筆 log 上，左側規則清單會亮起它命中的那一條規則。'));
-    if (rows.length > CAP) { sec.appendChild(el('p', 'say', '為了讓頁面順暢，最多顯示前 ' + CAP + ' 筆；摘要數字與匯出的 CSV 包含全部。')); }
+    sec.appendChild(el('h2', '', 'Log 明細（' + view.length.toLocaleString('en-US') + ' / ' + MS.rows.length.toLocaleString('en-US') + ' 筆' + (MS.filter === 'all' ? '' : '，已篩選') + '）'));
+    if (!view.length) { sec.appendChild(el('p', 'empty', MS.rows.length ? '沒有符合篩選條件的 log。' : '沒有可顯示的 log。')); host.appendChild(sec); return; }
+    sec.appendChild(el('p', 'say', '滑鼠移到某一筆 log 上，左側規則清單會亮起它命中的規則；按「跳轉」可把游標放到那一行並鎖定亮起。表格只繪製看得到的列，筆數再多也順暢。'));
 
-    var wrap = el('div', 'tablewrap');
-    var table = el('table', 'logtable');
-    var thead = el('thead'), htr = el('tr');
-    ['行', '時間', '連線', '最終動作', '命中', '備註'].forEach(function (h) { htr.appendChild(el('th', '', h)); });
-    thead.appendChild(htr); table.appendChild(thead);
-    var tbody = el('tbody');
-    rows.slice(0, CAP).forEach(function (r) {
+    var wrap = el('div', 'vwrap'), vt = el('div', 'vtable');
+    var head = el('div', 'vrow vhead');
+    ['行', '時間', '連線', '最終動作', '命中', '備註'].forEach(function (h) { head.appendChild(el('span', '', h)); });
+    var vp = el('div', 'vport');
+    var shown = Math.min(view.length, 12);
+    vp.style.height = (shown * ROW_H) + 'px';
+    var spacer = el('div', 'vspacer'); spacer.style.height = (view.length * ROW_H) + 'px';
+    var inner = el('div', 'vinner');
+    spacer.appendChild(inner); vp.appendChild(spacer);
+
+    var drawn = { a: -1, b: -2 };
+    function rowEl(r, i) {
       var lg = r.log;
-      var tr = el('tr', (!r.rule || r.mismatch) ? 'issue' : '');
-      tr.tabIndex = 0;
-      var ruleLine = r.rule ? r.rule.line : 0;
-      tr.addEventListener('mouseenter', function () { ED.mapRules.mark(ruleLine); });
-      tr.addEventListener('focus', function () { ED.mapRules.mark(ruleLine); });
-      tr.addEventListener('mouseleave', function () { ED.mapRules.mark(null); });
-      tr.addEventListener('blur', function () { ED.mapRules.mark(null); });
-      tr.appendChild(el('td', 'mono', String(lg.n)));
-      tr.appendChild(el('td', 'mono', lg.date + ' ' + lg.time));
-      tr.appendChild(el('td', 'mono', lg.proto + ' ' + lg.src + ' → ' + lg.dst + (lg.proto === 'ICMP' ? '' : ':' + lg.port)));
-      var td = el('td'); td.appendChild(el('span', 'pill ' + (r.final === '允許' ? 'allow' : 'deny'), r.final)); tr.appendChild(td);
-      tr.appendChild(el('td', '', r.rule ? '第 ' + r.rule.no + ' 條' : '預設政策'));
+      var row = el('div', 'vrow' + ((!r.rule || r.mismatch) ? ' issue' : ''));
+      row.dataset.i = String(i);
+      row.tabIndex = 0;
+      row.appendChild(el('span', 'mono', String(lg.n)));
+      row.appendChild(el('span', 'mono', lg.date + ' ' + lg.time));
+      var conn = lg.proto + ' ' + disp(lg.src) + ' → ' + (lg.proto === 'ICMP' ? disp(lg.dst) : hostPort(lg.dst, lg.port));
+      var c = el('span', 'mono', conn); c.title = conn; row.appendChild(c);
+      var td = el('span'); td.appendChild(el('span', 'pill ' + (r.final === '允許' ? 'allow' : 'deny'), r.final)); row.appendChild(td);
+      var hit = el('span', 'hitcell');
+      if (r.rule) {
+        hit.appendChild(document.createTextNode('第 ' + r.rule.no + ' 條 '));
+        var jb = el('button', 'jump', '跳轉'); jb.type = 'button'; jb.dataset.line = String(r.rule.line);
+        jb.title = '把左側規則清單的游標移到這一條，並鎖定亮起';
+        hit.appendChild(jb);
+      } else { hit.appendChild(document.createTextNode('預設政策')); }
+      row.appendChild(hit);
       var note = [];
       if (!r.rule) { note.push('沒有任何規則符合'); }
       if (r.mismatch) { note.push('log 記錄為「' + lg.action + '」，與最終動作不一致'); }
-      tr.appendChild(el('td', 'notecell', note.join('；')));
-      tbody.appendChild(tr);
+      var nt = el('span', 'notecell', note.join('；')); nt.title = note.join('；'); row.appendChild(nt);
+      return row;
+    }
+    function draw() {
+      var st = vp.scrollTop, hh = vp.clientHeight || shown * ROW_H;
+      var a = Math.max(0, Math.floor(st / ROW_H) - 6), b = Math.min(view.length - 1, Math.ceil((st + hh) / ROW_H) + 6);
+      if (a === drawn.a && b === drawn.b) { return; }
+      drawn = { a: a, b: b };
+      inner.textContent = '';
+      inner.style.top = (a * ROW_H) + 'px';
+      var frag = document.createDocumentFragment();
+      for (var i = a; i <= b; i++) { frag.appendChild(rowEl(view[i], i)); }
+      inner.appendChild(frag);
+    }
+    var onRow = function (e) {
+      var row = e.target.closest ? e.target.closest('.vrow') : null;
+      if (!row || row.classList.contains('vhead')) { return; }
+      var r = view[Number(row.dataset.i)];
+      ED.mapRules.mark(r && r.rule ? r.rule.line : PIN);
+    };
+    vp.addEventListener('scroll', draw);
+    vp.addEventListener('mouseover', onRow);
+    vp.addEventListener('focusin', onRow);
+    vp.addEventListener('mouseleave', function () { ED.mapRules.mark(PIN); });
+    vp.addEventListener('focusout', function () { ED.mapRules.mark(PIN); });
+    vp.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('.jump') : null;
+      if (b) { jumpToRule(Number(b.dataset.line)); }
     });
-    table.appendChild(tbody); wrap.appendChild(table); sec.appendChild(wrap);
+
+    vt.appendChild(head); vt.appendChild(vp); wrap.appendChild(vt); sec.appendChild(wrap);
     host.appendChild(sec);
+    draw();
   }
 
   function exportMap() {
@@ -872,15 +722,15 @@
       var lg = r.log, note = [];
       if (!r.rule) { note.push('沒有任何規則符合'); }
       if (r.mismatch) { note.push('與 log 記錄動作不一致'); }
-      out.push([lg.n, lg.date, lg.time, lg.proto, lg.src, lg.dst, lg.port, lg.action, r.rule ? r.rule.no : '', r.rule ? ruleText(r.rule) : '', r.final, r.rule ? '規則' : (MS.def === '允許' ? '預設允許' : '預設拒絕'), note.join('；')]);
+      out.push([lg.n, lg.date, lg.time, lg.proto, disp(lg.src), disp(lg.dst), lg.port, lg.action, r.rule ? r.rule.no : '', r.rule ? ruleText(r.rule) : '', r.final, r.rule ? '規則' : (MS.def === '允許' ? '預設允許' : '預設拒絕'), note.join('；')]);
     });
     downloadCsv('firewall-log-map-' + stamp() + '.csv', out);
   }
 
   /* =========================================================
-     十一、匯入 log 檔
+     八、匯入 log 檔
      ========================================================= */
-  var MAX_BYTES = 2 * 1024 * 1024;
+  var MAX_BYTES = 8 * 1024 * 1024;
   function say(msg, bad) {
     var m = $('importMsg');
     m.hidden = false;
@@ -902,7 +752,7 @@
   }
   function importLogFile(file) {
     if (!file) { return; }
-    if (file.size > MAX_BYTES) { say('檔案太大（' + Math.round(file.size / 1024) + ' KB），請拆成 2 MB 以內再匯入。', true); return; }
+    if (file.size > MAX_BYTES) { say('檔案太大（' + (file.size / 1048576).toFixed(1) + ' MB），請拆成 8 MB 以內再匯入。', true); return; }
     if (!/\.(txt|log|csv)$/i.test(file.name) && file.type.indexOf('text/') !== 0) {
       say('只支援文字檔（.txt、.log、.csv），「' + file.name + '」不是。', true); return;
     }
@@ -916,15 +766,16 @@
         if (c.skipped) { note = '，已略過標題列'; }
       }
       setVal('mapLogs', text);
-      var n = text.split(/\r?\n/).filter(function (l) { var t = l.trim(); return t && t.charAt(0) !== '#'; }).length;
-      say('已匯入「' + file.name + '」，共 ' + n + ' 行' + note + '。內容只在你的瀏覽器內處理，沒有上傳。', false);
+      var n = 0;
+      text.split(/\r?\n/).forEach(function (l) { var t = l.trim(); if (t && t.charAt(0) !== '#') { n++; } });
+      say('已匯入「' + file.name + '」，共 ' + n.toLocaleString('en-US') + ' 行' + note + '。內容只在你的瀏覽器內處理，沒有上傳。', false);
       renderMap();
     };
     reader.readAsText(file);
   }
 
   /* =========================================================
-     十二、事件與初始化
+     九、事件與初始化
      ========================================================= */
   function showTab(which) {
     var isDiff = which === 'diff';
@@ -943,11 +794,20 @@
   makeEditor('mapRules', 'rules');
   makeEditor('mapLogs', 'logs');
 
-  // 邊改邊看：輸入內容改變後，右側結果自動更新
+  // 邊改邊看：輸入內容改變後，右側結果自動更新。資料量很大時改為手動，避免每打一個字就重算。
+  function liveMap() {
+    if ($('mapLogs').value.length > BIG_CHARS) {
+      if (!$('staleNote')) {
+        var n = el('p', 'panel notice', '資料量大，已暫停即時更新。修改完請按「對應」重新計算。');
+        n.id = 'staleNote';
+        $('mapResult').insertBefore(n, $('mapResult').firstChild);
+      }
+    } else { renderMap(); }
+  }
   ED.oldRules.onchange = renderDiff;
   ED.newRules.onchange = renderDiff;
-  ED.mapRules.onchange = renderMap;
-  ED.mapLogs.onchange = renderMap;
+  ED.mapRules.onchange = liveMap;
+  ED.mapLogs.onchange = liveMap;
 
   $('tabDiff').addEventListener('click', function () { showTab('diff'); });
   $('tabLog').addEventListener('click', function () { showTab('log'); });
@@ -974,7 +834,6 @@
     clearTimeout(resetTimer);
     delete b.dataset.armed;
     b.textContent = '清除暫存並還原範例';
-    try { localStorage.removeItem(STORE); } catch (e) { /* 略過 */ }
     $('defPolicy').value = 'deny';
     $('importMsg').hidden = true;
     setVal('oldRules', SAMPLE_A); setVal('newRules', SAMPLE_B);
